@@ -113,3 +113,24 @@ textarea { resize: vertical; }
   #controls button.big { width: 54px; height: 54px; font-size: 24px; }
   .said { font-size: 17px; }
 }
+
+/* camera-on indicator */
+.camdot { color: #ff5d6c; font-size: 12px; letter-spacing: .02em; opacity: .85; }
+
+/* diagnostics strip (Settings > Listening) */
+#diag {
+  position: fixed; top: calc(env(safe-area-inset-top) + 34px); left: 12px; right: 12px; max-width: 26em;
+  padding: 7px 9px; border-radius: 10px; background: rgba(8, 10, 28, .62); backdrop-filter: blur(6px);
+  border: 1px solid rgba(140, 160, 255, .12);
+  color: #c9d0f0; font: 11.5px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  pointer-events: none; z-index: 3;
+}
+#diag[hidden] { display: none; }
+#diag .muted { color: #8790b4; }
+#diag .dl { overflow-wrap: anywhere; }
+#diag #dNums, #diag #dCam { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#diag .meter { position: relative; height: 7px; border-radius: 4px; background: rgba(255,255,255,.08); margin-bottom: 5px; overflow: hidden; }
+#diag .meter span { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: #4d6cff; transition: width .12s linear; }
+#diag .meter span.over { background: #ffcc00; }
+#diag .meter span.voice { background: #3ccf6e; }
+#diag .meter i { position: absolute; top: -1px; bottom: -1px; width: 2px; background: #ff5d6c; }

@@ -11,7 +11,9 @@
      onEnd(gotResult)
      onResult(text, isFinal)               onStart(), onWord(), onEnd(), onVoices()
      onSpeech()   any sign of speech
-     onState(state, detail)  "listening" | "idle" | "error"
+     onState(state, detail, code)  "listening" | "idle" | "error"
+     onEvent(name) every raw recognition event, for the diagnostics strip
+   js/whisper.js adds a third STT engine (on-device Whisper) with the same interface.
 */
 (function () {
   "use strict";
@@ -30,39 +32,44 @@
       this.lang = (opts && opts.lang) || "en-AU";
       this.running = false; this.rec = null; this.fatal = false;
       this.starts = 0; this.lastStart = 0; this.gotResult = false; this.maxTimer = 0; this.source = "";
-      this.onResult = noop; this.onSpeech = noop; this.onState = noop; this.onEnd = noop;
+      this.onResult = noop; this.onSpeech = noop; this.onState = noop; this.onEnd = noop; this.onEvent = noop;
     }
+    get kind() { return "browser"; }
     setLang(l) { this.lang = l || this.lang; if (this.rec) this.rec.lang = this.lang; }
     /** Start one recognition session. opts.track: optional audio MediaStreamTrack (Chrome 135+ desktop)
         so recognition can hear a slightly delayed copy of the mic, which keeps the first syllable. */
     start(opts) {
       opts = opts || {};
-      if (!this.supported) { this.onState("error", "Speech recognition isn't available in this browser"); return false; }
+      if (!this.supported) { this.onState("error", "Speech recognition isn't available in this browser", "unsupported"); return false; }
       if (this.fatal || this.running) return false;
-      const r = this._make();
+      const r = this._make(!!opts.continuous);
       this.rec = r; this.gotResult = false; this.source = opts.source || "";
       this.lastStart = Date.now(); this.starts++;
       this.running = true;                       // set now so nothing else starts a second session
       let ok = false;
-      if (opts.track && opts.track.readyState === "live") { try { r.start(opts.track); ok = true; } catch (e) { /* not supported: use the mic */ } }
-      if (!ok) { try { r.start(); ok = true; } catch (e) { ok = false; } }
+      this.usedTrack = false;
+      if (opts.track && opts.track.readyState === "live") { try { r.start(opts.track); ok = true; this.usedTrack = true; } catch (e) { /* not supported: use the mic */ } }
+      if (!ok) { try { r.start(); ok = true; } catch (e) { ok = false; this.onEvent("start-failed: " + (e && e.name)); } }
       if (!ok) { this.running = false; this.rec = null; return false; }
       clearTimeout(this.maxTimer);
-      this.maxTimer = setTimeout(() => this.stop(), opts.maxMs || 15000);   // never leave it open long
+      if (!opts.continuous) this.maxTimer = setTimeout(() => this.stop(), opts.maxMs || 15000);   // never leave it open long
       return true;
     }
     /** Stop listening but return what was heard. */
     stop() { if (this.rec && this.running) { try { this.rec.stop(); } catch (e) { /* already stopped */ } } }
     /** Stop now and throw away anything heard (used when Buddy starts talking). */
     abort() { if (this.rec && this.running) { try { this.rec.abort(); } catch (e) { /* already stopped */ } } }
-    _make() {
+    _make(continuous) {
       const r = new this.Impl();
-      r.continuous = false;                      // end by itself after one utterance
+      r.continuous = !!continuous;               // normally false: end by itself after one utterance
       r.interimResults = true;
       r.maxAlternatives = 1;
       r.lang = this.lang;
-      r.onstart = () => { this.onState("listening"); };
-      r.onspeechstart = () => this.onSpeech();
+      r.onstart = () => { if (r === this.rec) { this.onEvent("start"); this.onState("listening"); } };
+      r.onaudiostart = () => { if (r === this.rec) this.onEvent("audiostart"); };
+      r.onsoundstart = () => { if (r === this.rec) this.onEvent("soundstart"); };
+      r.onspeechstart = () => { if (r === this.rec) this.onEvent("speechstart"); this.onSpeech(); };
+      r.onnomatch = () => { if (r === this.rec) this.onEvent("nomatch"); };
       r.onresult = (ev) => {
         if (r !== this.rec) return;
         let interim = "", final = "";
@@ -71,26 +78,26 @@
           if (res.isFinal) final += res[0].transcript; else interim += res[0].transcript;
         }
         this.onSpeech();
+        this.onEvent(final.trim() ? "result (final)" : "result");
         if (final.trim()) { this.gotResult = true; this.onResult(final.trim(), true); }
         else if (interim.trim()) this.onResult(interim.trim(), false);
       };
       r.onerror = (ev) => {
         const e = ev.error;
+        if (r === this.rec) this.onEvent("error: " + e);
         if (e === "no-speech" || e === "aborted") return;           // normal
-        if (e === "not-allowed" || e === "service-not-allowed") {
-          this.fatal = true;
-          this.onState("error", "Microphone permission was refused");
-          return;
-        }
-        if (e === "audio-capture") this.onState("error", "No microphone found");
-        else if (e === "network") this.onState("error", "Speech service unreachable (needs internet)");
-        else if (e === "language-not-supported") this.onState("error", "Speech language not supported: " + this.lang);
-        else this.onState("error", "Speech error: " + e);
+        // The app decides what's fatal: on some phones "not-allowed"/"audio-capture" only mean the mic is busy.
+        if (e === "not-allowed" || e === "service-not-allowed") this.onState("error", "Microphone permission was refused", e);
+        else if (e === "audio-capture") this.onState("error", "No microphone found", e);
+        else if (e === "network") this.onState("error", "Speech service unreachable (needs internet)", e);
+        else if (e === "language-not-supported") this.onState("error", "Speech language not supported: " + this.lang, e);
+        else this.onState("error", "Speech error: " + e, e);
       };
       r.onend = () => {
         if (r !== this.rec) return;
         clearTimeout(this.maxTimer);
         this.running = false; this.rec = null;
+        this.onEvent("end");
         this.onState("idle");
         this.onEnd(this.gotResult);              // no restart: the next voice onset starts a new session
       };
@@ -177,7 +184,8 @@
        TTS: POST {"text": "...", "voice": "af_heart"} to {url}/tts -> audio/wav, played via an <audio> element
      The settings page shows the URL field disabled until this exists. */
   class LocalServerSTT {
-    constructor() { this.supported = false; this.running = false; this.starts = 0; this.onResult = noop; this.onSpeech = noop; this.onState = noop; this.onEnd = noop; }
+    constructor() { this.supported = false; this.running = false; this.starts = 0; this.onResult = noop; this.onSpeech = noop; this.onState = noop; this.onEnd = noop; this.onEvent = noop; }
+    get kind() { return "local"; }
     setLang() {}
     start() { this.onState("error", "The local speech server isn't built yet"); return false; }
     stop() {}
@@ -190,7 +198,8 @@
     cancel() {}
   }
 
-  DB.makeSTT = (engine, opts) => (engine === "local" ? new LocalServerSTT(opts) : new BrowserSTT(opts));
+  DB.makeSTT = (engine, opts) => (engine === "local" ? new LocalServerSTT(opts)
+    : engine === "whisper" && DB.WhisperSTT ? new DB.WhisperSTT(opts) : new BrowserSTT(opts));
   DB.makeTTS = (engine, opts) => (engine === "local" ? new LocalServerTTS(opts) : new BrowserTTS(opts));
   DB.BrowserSTT = BrowserSTT; DB.BrowserTTS = BrowserTTS;
 })();

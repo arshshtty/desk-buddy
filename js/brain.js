@@ -96,19 +96,21 @@
 
     /**
      * Ask Claude. Returns {text, mood, raw}. `image` is optional base64 JPEG.
+     * opts.noHistory: don't send or keep conversation memory (used by curious glances). opts.maxTokens.
      */
-    async ask(text, image) {
+    async ask(text, image, opts) {
+      opts = opts || {};
       const s = this.getSettings();
       const userContent = [];
       if (image) userContent.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: image } });
       userContent.push({ type: "text", text: text || "What do you see?" });
 
-      const keep = Math.max(0, (s.memory | 0) * 2);
+      const keep = opts.noHistory ? 0 : Math.max(0, (s.memory | 0) * 2);
       const past = keep ? this.history.slice(-keep) : [];
       while (past.length && past[0].role !== "user") past.shift();
       const messages = past.map((m) => ({ role: m.role, content: m.content })).concat([{ role: "user", content: userContent }]);
 
-      const body = { model: s.model || DB.store.DEFAULTS.model, max_tokens: 1024, system: this._system(s), tools: TOOLS, messages };
+      const body = { model: s.model || DB.store.DEFAULTS.model, max_tokens: opts.maxTokens || 1024, system: this._system(s), tools: TOOLS, messages };
       if (s.effort) body.output_config = { effort: s.effort };
 
       const ctrl = new AbortController();
@@ -131,6 +133,7 @@
         const reply = parseReply(rawText);
         if (!reply.text) reply.text = "Hmm.";
         // Rolling memory keeps plain text only; images aren't re-sent.
+        if (opts.noHistory) return { text: reply.text, mood: reply.mood, raw: rawText };
         this.history.push({ role: "user", content: (image ? "[showed you a camera picture] " : "") + (text || "What do you see?") });
         this.history.push({ role: "assistant", content: (reply.mood ? "[" + reply.mood + "] " : "") + reply.text });
         if (this.history.length > 40) this.history = this.history.slice(-40);

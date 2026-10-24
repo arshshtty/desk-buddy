@@ -20,6 +20,16 @@
   <div id="status" aria-live="polite">
     <span id="micDot" class="dot off" title="Microphone"></span>
     <span id="statusText">Tap to start</span>
+    <span id="camDot" class="camdot" title="The camera is on (looked at on this device only)" hidden>● cam</span>
+  </div>
+
+  <div id="diag" aria-label="Listening diagnostics">
+    <div class="meter"><span id="dLvl"></span><i id="dTh" hidden></i></div>
+    <div class="dl"><b id="dState">not started</b> · <span id="dEngine"></span></div>
+    <div class="dl muted" id="dNums"></div>
+    <div class="dl muted" id="dEvent"></div>
+    <div class="dl" id="dText"></div>
+    <div class="dl muted" id="dCam"></div>
   </div>
 
   <div id="captions">
@@ -42,7 +52,7 @@
   <div id="startOverlay">
     <div class="card">
       <h1>Desk Buddy</h1>
-      <p>Tap to wake me up. I'll ask for the microphone, and for the camera if you've switched it on in settings.</p>
+      <p>Tap to wake me up. I'll ask for the microphone and the camera. The camera picture stays on this device; it only lets me react to you.</p>
       <button id="btnStart" class="primary">Start</button>
       <p id="secureWarn" class="warn" hidden>This page isn't on HTTPS or localhost, so the browser will block the microphone and camera. Open it over HTTPS or from localhost.</p>
     </div>
@@ -99,7 +109,23 @@
             <option value="off">Off: microphone never used</option>
           </select>
         </label>
-        <p class="muted small" id="beepNote">On Android, Chrome plays a short sound each time speech recognition starts, and a web page can't turn that off. "Always" keeps it to one sound each time you start speaking (not a constant on/off loop). "Tap to talk only" makes no sound until you press 🎙️. The local Whisper speech server planned for later removes the sound entirely. Tip: put "Hey" before the wake word ("Hey Jarvis, …") so the phone has started listening by the time you say the name.</p>
+        <p class="muted small" id="beepNote">On Android, Chrome plays a short sound each time Web Speech recognition starts, and a web page can't turn that off. "Always" keeps it to one sound each time you start speaking. "Tap to talk only" makes no sound until you press 🎙️. The On-device Whisper engine (Speech engines, below) makes no sound at all. Tip: with Web Speech, put "Hey" before the wake word ("Hey Jarvis, …") so the phone has started listening by the time you say the name.</p>
+        <label>Mic sensitivity <output id="oSens"></output> (higher hears quieter speech)
+          <input id="sSens" type="range" min="1" max="10" step="1">
+        </label>
+        <div class="row">
+          <button type="button" id="btnCalibrate">Calibrate mic</button>
+          <button type="button" id="btnClearCal">Forget calibration</button>
+        </div>
+        <p class="muted small" id="calState"></p>
+        <label>Mic processing
+          <select id="sMicProc">
+            <option value="balanced">Balanced: echo cancelling + auto gain (default)</option>
+            <option value="full">Full: also noise suppression (can hide quiet voices)</option>
+            <option value="raw">Raw: echo cancelling only</option>
+          </select>
+        </label>
+        <label class="check"><input id="sDiag" type="checkbox"> Show the diagnostics strip (mic level, state, last event)</label>
         <label>Buddy's name (shown in the captions)
           <input id="sName" autocomplete="off" spellcheck="false" placeholder="Buddy">
         </label>
@@ -130,12 +156,30 @@
         <legend>Camera</legend>
         <label>Camera
           <select id="sCamera">
+            <option value="user">Camera on at start: front (default)</option>
+            <option value="environment">Camera on at start: back</option>
             <option value="off">Off until I press Look</option>
-            <option value="user">Front camera, on at start</option>
-            <option value="environment">Back camera, on at start</option>
           </select>
         </label>
-        <label class="check"><input id="sMotion" type="checkbox"> Follow motion with the eye (the camera must be on)</label>
+        <p class="muted small">With the camera on, the face reacts to what it sees: the eyes follow you, it says hello when you come back, gets sleepy in the dark and wakes when the lights come on. This is worked out on this device from a tiny 160×120 picture; nothing is sent anywhere. The camera pauses when this page is hidden.</p>
+        <label class="check"><input id="sMotion" type="checkbox"> Follow motion with the eyes</label>
+        <label class="check"><input id="sFaceDetect" type="checkbox"> Look at faces (on-device face detector, where the browser has one)</label>
+        <p class="muted small" id="faceDetState"></p>
+        <label class="check"><input id="sGreetHi" type="checkbox"> Say "Hi!" out loud when you come back</label>
+        <label>…at most every (minutes)
+          <input id="sGreetMin" type="number" min="1" max="240" step="1">
+        </label>
+        <label>Curious glances
+          <select id="sGlances">
+            <option value="off">Off (default)</option>
+            <option value="show">On: show a remark on screen</option>
+            <option value="speak">On: say a remark out loud</option>
+          </select>
+        </label>
+        <label>…one glance every (minutes)
+          <input id="sGlanceMin" type="number" min="2" max="240" step="1">
+        </label>
+        <p class="muted small">Curious glances send one small photo (320 px) to Claude every few minutes while someone is in view, and Buddy comments on it. Each glance uses roughly 100 input tokens for the picture (Anthropic's rule of thumb is width × height ÷ 750), plus the personality prompt and a short reply of up to 120 tokens: about the cost of one short question. These are estimates; check usage in the Claude Console.</p>
         <label class="check"><input id="sPreview" type="checkbox"> Show a small camera preview</label>
       </fieldset>
 
@@ -143,8 +187,24 @@
         <legend>Speech engines</legend>
         <label>Speech to text
           <select id="sSttEngine">
-            <option value="browser">Browser (Web Speech API)</option>
-            <option value="local" disabled>Local server: faster-whisper (coming later)</option>
+            <option value="auto">Auto: Web Speech, with fallbacks (default)</option>
+            <option value="browser">Web Speech only</option>
+            <option value="whisper">On-device Whisper (no beeps, private)</option>
+          </select>
+        </label>
+        <label>Whisper model
+          <select id="sWhisperModel">
+            <option value="Xenova/whisper-tiny.en">tiny.en: faster, about 40 MB download (default)</option>
+            <option value="Xenova/whisper-base.en">base.en: more accurate, about 75 MB download</option>
+          </select>
+        </label>
+        <p class="muted small">On-device Whisper downloads the model once from Hugging Face, then keeps it in this browser. Your voice never leaves the device and there's no beep. It needs a reasonably recent phone, and it takes a second or two to transcribe after you stop talking.</p>
+        <label>Web Speech mic strategy
+          <select id="sSrMode">
+            <option value="auto">Auto: find what works on this device (default)</option>
+            <option value="shared">Shared: recognition and the voice detector share the mic</option>
+            <option value="release">Release: close the voice detector's mic while recognising</option>
+            <option value="continuous">Continuous: always-on recognition (beeps on Android)</option>
           </select>
         </label>
         <label>Text to speech
@@ -162,7 +222,7 @@
         <legend>Screen</legend>
         <label>Face
           <select id="sFace">
-            <option value="ball">Round ball (new)</option>
+            <option value="sphere">Sphere (default)</option>
             <option value="eye">Classic eye</option>
           </select>
         </label>
@@ -172,7 +232,7 @@
         </label>
       </fieldset>
 
-      <p class="muted small">The microphone and camera only work over HTTPS or on localhost. In Chrome, speech recognition is processed by Google's servers.</p>
+      <p class="muted small">The microphone and camera only work over HTTPS or on localhost. In Chrome, Web Speech recognition is processed by Google's servers; On-device Whisper isn't.</p>
 
       <div class="row end">
         <button value="cancel" formnovalidate>Cancel</button>
@@ -196,8 +256,9 @@
 
   <script src="js/store.js"></script>
   <script src="js/eye.js"></script>
-  <script src="js/face-ball.js"></script>
+  <script src="js/face-sphere.js"></script>
   <script src="js/adapters.js"></script>
+  <script src="js/whisper.js"></script>
   <script src="js/vad.js"></script>
   <script src="js/camera.js"></script>
   <script src="js/brain.js"></script>

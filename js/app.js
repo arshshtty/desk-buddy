@@ -1,26 +1,54 @@
-/* Desk Buddy: wiring. Voice detected -> one recognition session -> wake word -> command -> local intent or Claude
-   -> speech, with the eye reacting throughout. While Buddy talks (and for 800 ms after) the mic is ignored,
-   and anything that sounds like Buddy's own recent words is dropped, so it never answers itself. */
+/* Desk Buddy: wiring. Voice detected -> one recognition session (Web Speech) or one on-device Whisper
+   transcription -> wake word -> command -> local intent or Claude -> speech, with the face reacting
+   throughout. While Buddy talks (and for 800 ms after) the mic is ignored, and anything that sounds like
+   Buddy's own recent words is dropped, so it never answers itself.
+
+   Web Speech on phones: some phones won't let recognition hear the mic while the voice detector holds
+   it. That is detected (an error, no audio within a few seconds, or nothing recognised while you were
+   clearly talking) and the app switches strategy automatically: "shared" -> "release" (close the
+   detector's mic while recognising, reopen it after) -> "continuous" (plain always-on recognition,
+   which beeps on Android). What worked is remembered on the device. The diagnostics strip shows it all.
+
+   The camera (on by default) is only analysed on the device: motion, a face, someone arriving, the
+   lights. Nothing is sent to Claude unless you ask it to look, or turn on "curious glances". */
 (function () {
   "use strict";
   const DB = window.DB;
   const $ = (id) => document.getElementById(id);
 
   let settings = DB.store.loadSettings();
-  let eye = DB.makeFace(settings.face, $("eye"));   // "ball" (default) or "eye": same interface either way
+  let eye = DB.makeFace(settings.face, $("eye"));   // "sphere" (default) or "eye": same interface either way
   function setFace(kind) {
     const old = eye;
-    if ((kind === "eye") === !(old instanceof DB.BallFace)) return;
+    if ((kind === "eye" ? "eye" : "sphere") === old.kind) return;
     old.destroy();
     eye = DB.makeFace(kind, $("eye"));
     eye.adopt(old);
   }
   const cam = new DB.Camera($("preview"));
-  let stt = DB.makeSTT(settings.sttEngine, { lang: settings.lang });
   let tts = DB.makeTTS(settings.ttsEngine);
   const notesApi = { add: (t) => DB.store.addNote(t), list: () => DB.store.notes() };
   const brain = new DB.Brain(() => settings, () => DB.store.getKey(), notesApi);
   const vad = new DB.VoiceDetector();
+  function applyVadSettings() {
+    vad.sensitivity = +settings.sensitivity || 6;
+    vad.calibration = settings.micCal && settings.micCal.noise ? settings.micCal : null;
+    const changed = vad.processing !== settings.micProcessing;
+    vad.processing = settings.micProcessing || "balanced";
+    return changed;
+  }
+  applyVadSettings();
+  // Which recogniser: "auto" = Web Speech (with the fallbacks), or on-device Whisper where Web Speech is missing.
+  const hasWebSpeech = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+  const engineFor = (s) => (s.sttEngine === "whisper" || (s.sttEngine === "auto" && !hasWebSpeech) ? "whisper" : "browser");
+  let stt = makeEngine();
+  function makeEngine() {
+    const kind = engineFor(settings);
+    const e = DB.makeSTT(kind, { lang: settings.lang, model: settings.whisperModel });
+    if (kind === "whisper") e.attach(vad);
+    return e;
+  }
+  const isWhisper = () => stt.kind === "whisper";
 
   const COOLDOWN_MS = 2000;     // recognition starts at most once every 2 s (each start beeps on Android)
   const TAIL_MS = 800;          // keep ignoring the mic this long after Buddy stops talking
@@ -45,8 +73,27 @@
     sessionSource: "",      // what started the current recognition session: "voice" | "tap"
     recentSaid: [],         // last two things Buddy said, for the echo filter
     drops: { echo: 0, muted: 0, ignored: 0 },
-    releaseMic: false,      // fallback if a phone won't let recognition share the mic with the detector
+    strategy: "shared",     // Web Speech mic strategy in use: "shared" | "release" | "continuous"
+    srFails: 0,             // failures in a row with the current strategy
+    lastFailure: "",
+    sess: null,             // the current Web Speech session, for failure detection
+    watchdogMs: 3500,       // no audio from the recogniser this long after it starts = it can't hear the mic
+    lastVoiceEnd: 0,
+    contBackoff: 0,
+    events: [],             // recent recognition events, for the diagnostics strip
+    lastTranscript: "",
+    camError: "",
+    darkAt: 0,
+    lastHi: 0,
+    greets: 0,
+    lastGlanceAsk: 0,
+    glances: 0,
   };
+  function pickStrategy() {
+    st.strategy = settings.srMode !== "auto" ? settings.srMode : (DB.store.learnedStrategy() || "shared");
+    st.srFails = 0;
+  }
+  pickStrategy();
 
   /* ---------------- small helpers ---------------- */
   function setStatus(text, dot) {
@@ -59,12 +106,18 @@
     if (st.error) return setStatus(st.error, "err");
     if (tts.speaking) return setStatus("Speaking… tap the eye to stop", "on");
     if (brain.busy) return setStatus("Thinking…", "on");
+    if (isWhisper() && stt.state === "loading") return setStatus("Getting the on-device speech model ready… " + progressText(), "off");
+    if (isWhisper() && stt.pending) return setStatus("Working out what you said…", "wake");
     if (stt.running) return setStatus(listeningForCommand() ? "Listening…" : "Hearing you…", "wake");
     if (listeningForCommand()) return setStatus(settings.listenMode === "always" ? "Listening… just talk" : "Press 🎙️ to talk", "wake");
     if (settings.listenMode === "off") return setStatus("Microphone off (settings)", "off");
     if (settings.listenMode === "tap") return setStatus("Press 🎙️ to talk", "off");
-    if (vad.running) return setStatus('Say "' + settings.wakeWord + '…" or press 🎙️', "on");
+    if (vad.running || (st.strategy === "continuous" && !isWhisper())) return setStatus('Say "' + settings.wakeWord + '…" or press 🎙️', "on");
     return setStatus("Mic starting…", "off");
+  }
+  function progressText() {
+    const p = stt.progress || {};
+    return p.total ? Math.round(p.loaded / 1e6) + " of " + Math.round(p.total / 1e6) + " MB" : "";
   }
   function listeningForCommand() {
     const now = Date.now();
@@ -144,10 +197,24 @@
   }
 
   /* ---------------- speech in ---------------- */
-  // Only start recognition when it's needed: a voice onset in "always" mode, or a tap. At most once per COOLDOWN_MS.
+  function logEvent(name) {
+    st.events.push({ name, at: Date.now() });
+    if (st.events.length > 8) st.events.shift();
+  }
+  function abortSTT() { if (st.sess) st.sess.aborted = true; if (stt.running || stt.pending) stt.abort(); }
+
+  // Only start recognition when it's needed: a voice onset in "always" mode, or a tap. At most once per COOLDOWN_MS
+  // for Web Speech (each start beeps on Android); Whisper makes no sound, so it has no cooldown.
   function startRecognition(source) {
     if (!st.started || settings.listenMode === "off" || stt.running || muted() || !stt.supported) return false;
-    if (source === "voice" && settings.listenMode !== "always") return false;
+    if (source === "voice" && settings.listenMode !== "always" && !(isWhisper() && Date.now() < st.pttUntil)) return false;
+    if (isWhisper()) {
+      if (!vad.running) { ensureMic(true).then(() => { if (!stt.running && !muted()) stt.start({ source }); idleStatus(); }); return true; }
+      const ok = stt.start({ source });
+      idleStatus();
+      return ok;
+    }
+    if (st.strategy === "continuous" && settings.listenMode === "always") { runContinuous(); return stt.running; }
     const wait = COOLDOWN_MS - (Date.now() - st.lastSttStart);
     if (wait > 0) {
       // Too soon: try again when the cooldown ends if you're still talking (or you tapped).
@@ -158,53 +225,142 @@
       }, wait + 10);
       return false;
     }
-    if (st.releaseMic && vad.running) vad.stop();
+    const release = st.strategy !== "shared";
+    if (release && vad.running) vad.stop();
     st.lastSttStart = Date.now();
     st.sessionSource = source;
-    const ok = stt.start({ track: st.releaseMic ? null : vad.track, source });
+    const sess = (st.sess = { t: Date.now(), source, strategy: st.strategy, audio: false, result: false, aborted: false, error: "" });
+    const ok = stt.start({ track: release ? null : vad.track, source, continuous: st.strategy === "continuous" });
+    if (!ok) st.sess = null;
+    else {
+      // Watchdog: recognition that started but never got any audio can't hear the mic.
+      setTimeout(() => {
+        if (st.sess === sess && !sess.audio && !sess.result && !sess.aborted && stt.running) {
+          srFailure("no audio reached speech recognition within " + (st.watchdogMs / 1000) + " s", 2);
+          sess.aborted = true; stt.abort();
+        }
+      }, st.watchdogMs);
+    }
     idleStatus();
     return ok;
   }
-  async function ensureMic() {
-    if (!st.started || settings.listenMode !== "always" || vad.running || stt.running) return;
-    try { await vad.start(); if (/^Microphone/.test(st.error)) st.error = ""; }
-    catch (e) {
+  // Plain continuous recognition: the last-resort fallback for phones where nothing else hears you.
+  function runContinuous() {
+    clearTimeout(st.contTimer); st.contTimer = 0;
+    if (!st.started || isWhisper() || st.strategy !== "continuous" || settings.listenMode !== "always" || stt.running || muted()) return;
+    if (vad.running) vad.stop();
+    st.lastSttStart = Date.now();
+    st.sess = { t: Date.now(), source: "continuous", strategy: "continuous", audio: false, result: false, aborted: false };
+    stt.start({ continuous: true, source: "continuous" });
+    idleStatus();
+  }
+  /** Count a Web Speech failure; after `limit` in a row, move to the next strategy. */
+  function srFailure(reason, limit) {
+    st.lastFailure = reason;
+    st.srFails++;
+    logEvent("failure: " + reason);
+    if (st.srFails < limit) return;
+    if (settings.srMode !== "auto") { st.error = "Speech recognition can't hear the mic (" + reason + "). Try another option under Settings > Listening."; idleStatus(); return; }
+    const next = st.strategy === "shared" ? "release" : st.strategy === "release" ? "continuous" : "";
+    if (!next) return;
+    st.strategy = next; st.srFails = 0;
+    DB.store.setLearnedStrategy(next);
+    logEvent("switched to " + next);
+    if (next === "continuous") {
+      showSaid("I couldn't hear you through the voice detector, so I've switched to plain always-on recognition. On Android it will beep each time it restarts. On-device Whisper (Settings > Speech engines) avoids that.", true);
+      setTimeout(runContinuous, 400);
+    }
+    idleStatus();
+  }
+  async function ensureMic(force) {
+    if (!st.started || settings.listenMode === "off" || vad.running) return;
+    if (settings.listenMode !== "always" && !force) return;
+    if (!isWhisper()) {
+      if (stt.running) return;
+      if (st.strategy === "continuous") { runContinuous(); return; }
+    }
+    try {
+      applyVadSettings();
+      await vad.start();
+      if (/^Microphone/.test(st.error)) st.error = "";
+    } catch (e) {
       st.error = "Microphone: " + (e && e.name === "NotAllowedError" ? "permission was refused" : (e && (e.message || e.name)) || "unavailable");
     }
     idleStatus();
   }
   function updateMute() {
     vad.setMuted(muted());
-    if (!muted() && st.mutePending) { st.mutePending = false; idleStatus(); }
+    if (!muted() && st.mutePending) { st.mutePending = false; idleStatus(); runContinuous(); }
   }
 
   function wireSTT() {
     stt.onSpeech = () => { if (!muted()) activity("speech"); };
-    stt.onState = (state, detail) => {
+    stt.onEvent = (name) => {
+      logEvent(name);
+      const sess = st.sess;
+      if (!sess) return;
+      if (/^(audiostart|soundstart|speechstart)$/.test(name)) sess.audio = true;
+      if (/^result/.test(name)) { sess.result = true; sess.audio = true; st.srFails = 0; }
+    };
+    stt.onProgress = () => { idleStatus(); };
+    stt.onState = (state, detail, code) => {
       if (state === "error") {
-        // Some phones may not let recognition use the mic while the detector holds it open.
-        if (/No microphone/.test(detail || "") && vad.running && !st.releaseMic) { st.releaseMic = true; return; }
+        const sess = st.sess;
+        if (!isWhisper() && sess && (code === "audio-capture" || code === "not-allowed")) {
+          sess.error = code;
+          // With the detector holding the mic, these usually mean "the mic is busy", not a missing mic or a refusal.
+          if (sess.strategy === "shared") { srFailure(code + " while the voice detector had the mic", 1); return; }
+          if (sess.strategy === "release" && code === "audio-capture") { srFailure(code, 2); return; }
+          if (code === "not-allowed") stt.fatal = true;
+        }
         st.error = detail || "Microphone error";
       } else if (state === "listening") st.error = "";
       idleStatus();
     };
-    stt.onEnd = () => {
-      // No restart here. The next voice onset (or tap) starts the next session.
-      if (st.releaseMic) ensureMic();
+    stt.onEnd = (got) => {
+      // No restart here (except the continuous fallback). The next voice onset (or tap) starts the next session.
+      const sess = st.sess; st.sess = null;
+      if (!isWhisper() && sess && !sess.result && !sess.aborted && !sess.error && sess.source === "voice") {
+        // A voice started this session but nothing was recognised. Once is normal (a cough, the TV);
+        // repeatedly means recognition can't hear the mic this way.
+        const voiceMs = (vad.inSpeech ? Date.now() : st.lastVoiceEnd) - sess.t;
+        if (sess.strategy === "release" || voiceMs >= 800) srFailure("nothing recognised while you were talking", sess.strategy === "release" ? 3 : 2);
+      }
+      if (!isWhisper() && st.strategy === "continuous" && settings.listenMode === "always") {
+        const dur = Date.now() - st.lastSttStart;
+        st.contBackoff = dur < 1500 ? Math.min(5000, (st.contBackoff || 250) * 2) : 0;
+        clearTimeout(st.contTimer);
+        st.contTimer = setTimeout(runContinuous, st.contBackoff || 250);
+      } else if (!isWhisper() && st.strategy !== "shared") ensureMic();
+      if (isWhisper() && settings.listenMode !== "always" && !stt.running && Date.now() >= st.pttUntil) vad.stop();
       const h = $("heard");
       if (h.classList.contains("partial")) showHeard("");
       idleStatus();
     };
     stt.onResult = (text, isFinal) => {
+      if (isFinal) st.lastTranscript = text;
       if (muted()) { if (isFinal) st.drops.muted++; return; }
       if (!isFinal) { if (!isEcho(text)) showHeard(text, "partial"); return; }
       handleFinal(text);
+      if (isWhisper() && settings.listenMode !== "always" && Date.now() >= st.pttUntil) vad.stop();
     };
     vad.onVoiceStart = () => {
       if (muted()) return;
       if (eye.asleep || eye.mood === "sleepy") activity("voice"); else st.lastActivity = Date.now();
+      if (isWhisper() && stt.armed && !stt.running) { stt.begin("tap"); idleStatus(); return; }
       startRecognition("voice");
     };
+    vad.onVoiceEnd = () => {
+      st.lastVoiceEnd = Date.now();
+      if (isWhisper() && stt.running) { stt.finish(); idleStatus(); }
+    };
+  }
+  function switchEngine() {
+    abortSTT();
+    stt = makeEngine();
+    pickStrategy();
+    wireSTT();
+    if (st.started && isWhisper()) stt.load();
   }
 
   /** Handle one final transcript. Returns what happened, for the tests:
@@ -298,7 +454,7 @@
       eye.setMood("surprised", 2);
       return say("I can't see anything. " + (e && e.message ? e.message : "The camera didn't start."), true);
     } finally {
-      if (tempCam && settings.camera === "off") cam.stop();
+      if (tempCam && (settings.camera === "off" || st.camError)) cam.stop();
       updateCamButtons();
     }
     return ask(question || "What is this? Look at the picture and tell me briefly.", image);
@@ -326,8 +482,9 @@
       // Hard mute: Buddy must never hear itself. Kill any running recognition and ignore the mic.
       st.muteUntil = Infinity;
       clearTimeout(st.pendingStart); st.pendingStart = 0;
+      clearTimeout(st.contTimer); st.contTimer = 0;
       vad.setMuted(true);
-      if (stt.running) stt.abort();
+      abortSTT();
       if ($("heard").classList.contains("partial")) showHeard("");
       eye.setSpeaking(true); idleStatus();
     };
@@ -397,7 +554,8 @@
     $("btnTalk").classList.add("active");
     idleStatus();
     // after a tap barge-in, wait out the short mute tail first
-    setTimeout(() => startRecognition("tap"), wasSpeaking ? BARGE_TAIL_MS + 30 : 0);
+    if (!(st.strategy === "continuous" && stt.running && !isWhisper()))
+      setTimeout(() => startRecognition("tap"), wasSpeaking ? BARGE_TAIL_MS + 30 : 0);
     setTimeout(() => {
       if (Date.now() >= st.pttUntil) {
         $("btnTalk").classList.remove("active");
@@ -431,13 +589,88 @@
     $("btnCam").classList.toggle("active", cam.on);
     $("btnFlip").title = "Switch camera (now " + (cam.facing === "user" ? "front" : "back") + ")";
     $("preview").hidden = !(cam.on && settings.preview);
+    $("camDot").hidden = !cam.on;
     cam.motionOn = !!settings.motion;
+    if (!settings.faceDetect) cam.detector = null;
   }
+  async function startCamera(facing) {
+    try {
+      await cam.start(facing);
+      st.camError = "";
+    } catch (e) {
+      st.camError = e && e.name === "NotAllowedError" ? "blocked" : (e && (e.message || e.name)) || "unavailable";
+      cam.stop();
+    }
+    updateCamButtons();
+    return !st.camError;
+  }
+  function cameraNote() {
+    return st.camError === "blocked"
+      ? "The camera is blocked, so I can't see you. I'll still listen. You can allow it in the browser's site settings, or turn it off in Settings."
+      : "The camera didn't start (" + st.camError + "). I'll still listen.";
+  }
+
+  /* ---------------- perception (camera, on this device only) ---------------- */
+  const faceRecent = () => cam.face && Date.now() - cam.faceAt < 1500;
+  const busyFace = () => eye.asleep || eye.mood === "thinking" || (down && !down.barge);
   cam.onMotion = (mv) => {
+    if (cam.light === "dark") return;
     if (mv.amount > 0.04) activity("motion");
-    if (eye.asleep || eye.mood === "thinking" || (down && !down.barge)) return;
+    if (busyFace() || faceRecent()) return;
     eye.lookAt(mv.x, mv.y * 0.8, 700);
   };
+  cam.onFace = (f) => {
+    if (busyFace()) return;
+    eye.lookAt(f.x * 1.1, f.y * 0.8, 900);
+  };
+  cam.onPresence = (present, awayMs) => {
+    if (!present || !st.started) return;
+    if (awayMs < cam.awayMs) return;
+    // Someone's back after a while: wake up with a little greeting.
+    st.greets++;
+    activity("presence");
+    eye.wake(false);
+    eye.setMood("happy", 2.5); eye.blink(); if (eye.poke) eye.poke();
+    const now = Date.now();
+    if (settings.greetHi && !tts.speaking && !brain.busy && now - st.lastHi > Math.max(1, +settings.greetMinutes || 10) * 60000) {
+      st.lastHi = now;
+      say("Hi!", true);
+    }
+  };
+  cam.onLight = (l) => {
+    if (!st.started) return;
+    if (l === "dark") {
+      st.darkAt = Date.now();
+      if (!tts.speaking && !brain.busy) eye.setMood("sleepy");
+    } else {
+      st.darkAt = 0;
+      if (eye.asleep || eye.mood === "sleepy") { activity("tap"); eye.wake(true); }
+    }
+  };
+  cam.onStartle = () => {
+    if (!st.started || eye.asleep || tts.speaking) return;
+    activity("motion");
+    eye.setMood("surprised", 1.2);
+    if (eye.poke) eye.poke();
+  };
+  // Curious glances (opt-in, off by default): one small photo every N minutes while someone is there.
+  async function maybeGlance() {
+    const now = Date.now();
+    if (settings.glances === "off" || !st.started || !cam.on || !cam.present || !DB.store.getKey()) return;
+    if (tts.speaking || brain.busy || listeningForCommand() || eye.asleep || stt.running) return;
+    if (now - st.lastGlanceAsk < Math.max(1, +settings.glanceMinutes || 10) * 60000) return;
+    st.lastGlanceAsk = now;
+    try {
+      const image = await cam.grab(320, 0.6);
+      st.glances++;
+      const r = await brain.ask("(Curious glance: nobody asked you anything. Look at this camera picture and make one short, friendly, " +
+        "playful remark about something you notice, in under 15 words. Don't ask a question.)", image, { noHistory: true, maxTokens: 120 });
+      if (tts.speaking || listeningForCommand()) return;
+      eye.setMood(r.mood || "curious", 4);
+      if (settings.glances === "speak") say(r.text, true); else showSaid(r.text, true);
+    } catch (e) { /* a glance is optional: stay quiet on errors */ }
+  }
+  setInterval(maybeGlance, 20000);
 
   /* ---------------- always-on helpers ---------------- */
   async function requestWakeLock() {
@@ -449,6 +682,8 @@
   }
   function releaseWakeLock() { if (st.wakeLock) { st.wakeLock.release().catch(() => {}); st.wakeLock = null; } }
   document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") { cam.pause(); updateCamButtons(); return; }
+    if (cam.paused && st.started) cam.resume().catch(() => {}).then(updateCamButtons);
     if (document.visibilityState === "visible" && st.started) {
       requestWakeLock();
       if (vad.running && vad.stream && vad.stream.getAudioTracks().some((t) => t.readyState !== "live")) vad.stop();
@@ -468,6 +703,8 @@
     const now = Date.now(), idle = now - st.lastActivity;
     const sleepyAfter = Math.max(1, +settings.sleepyMinutes || 3) * 60000;
     if (tts.speaking || brain.busy || listeningForCommand()) { st.lastActivity = Math.max(st.lastActivity, now - 5000); return; }
+    cam.setSlow(!!eye.asleep);
+    if (st.darkAt && cam.light === "dark" && now - st.darkAt > 20000 && !eye.asleep) { eye.sleep(); $("controls").classList.add("dim"); }
     if (eye.asleep) return;
     if (idle > 20000 && now - st.lastGlance > 15000 && Math.random() < 0.15) {   // random glance with a double blink
       st.lastGlance = now;
@@ -505,12 +742,25 @@
     fillVoices();
     $("sRate").value = s.rate; $("sPitch").value = s.pitch; $("oRate").textContent = (+s.rate).toFixed(2); $("oPitch").textContent = (+s.pitch).toFixed(2);
     $("sCamera").value = s.camera; $("sMotion").checked = s.motion; $("sPreview").checked = s.preview;
+    $("sFaceDetect").checked = s.faceDetect; $("sGreetHi").checked = s.greetHi; $("sGreetMin").value = s.greetMinutes;
+    $("sGlances").value = s.glances; $("sGlanceMin").value = s.glanceMinutes;
     $("sSttEngine").value = s.sttEngine; $("sTtsEngine").value = s.ttsEngine; $("sLocalUrl").value = s.localUrl;
+    $("sWhisperModel").value = s.whisperModel; $("sSrMode").value = s.srMode;
+    $("sSens").value = s.sensitivity; $("oSens").textContent = s.sensitivity; $("sMicProc").value = s.micProcessing;
+    $("sDiag").checked = s.diagnostics;
+    $("calState").textContent = s.micCal ? "Calibrated: room " + s.micCal.noise.toFixed(4) + ", voice " + s.micCal.speech.toFixed(4) + "." : "Not calibrated (uses the automatic noise floor).";
+    $("faceDetState").textContent = cam.detector || ("FaceDetector" in window) ? "This browser can detect faces on the device." : "This browser has no face detector, so the eyes follow motion only.";
     $("sWakeLock").checked = s.wakeLock; $("sSleepy").value = s.sleepyMinutes; $("sFace").value = s.face;
     keyState();
     $("settingsDlg").showModal();
     $("settingsForm").scrollTop = 0;
   }
+  $("sSens").addEventListener("input", () => { $("oSens").textContent = $("sSens").value; });
+  $("btnCalibrate").addEventListener("click", () => { $("settingsDlg").close("cancel"); calibrate(); });
+  $("btnClearCal").addEventListener("click", () => {
+    settings = Object.assign({}, settings, { micCal: null }); DB.store.saveSettings(settings); applyVadSettings();
+    $("calState").textContent = "Not calibrated (uses the automatic noise floor).";
+  });
   $("sRate").addEventListener("input", () => { $("oRate").textContent = (+$("sRate").value).toFixed(2); });
   $("sPitch").addEventListener("input", () => { $("oPitch").textContent = (+$("sPitch").value).toFixed(2); });
   $("btnClearKey").addEventListener("click", () => { DB.store.clearKey(); $("sKey").value = ""; keyState(); });
@@ -536,9 +786,19 @@
       voiceURI: $("sVoice").value,
       rate: num("sRate", 1), pitch: num("sPitch", 1),
       camera: $("sCamera").value, motion: $("sMotion").checked, preview: $("sPreview").checked,
-      sttEngine: "browser", ttsEngine: "browser",                  // local server isn't built yet
+      faceDetect: $("sFaceDetect").checked, greetHi: $("sGreetHi").checked,
+      greetMinutes: Math.max(1, Math.min(240, Math.round(num("sGreetMin", 10)))),
+      glances: ["off", "show", "speak"].includes($("sGlances").value) ? $("sGlances").value : "off",
+      glanceMinutes: Math.max(2, Math.min(240, Math.round(num("sGlanceMin", 10)))),
+      sttEngine: ["auto", "browser", "whisper"].includes($("sSttEngine").value) ? $("sSttEngine").value : "auto",
+      whisperModel: $("sWhisperModel").value in DB.WHISPER_MODELS ? $("sWhisperModel").value : DB.store.DEFAULTS.whisperModel,
+      srMode: ["auto", "shared", "release", "continuous"].includes($("sSrMode").value) ? $("sSrMode").value : "auto",
+      sensitivity: Math.max(1, Math.min(10, Math.round(num("sSens", 6)))),
+      micProcessing: $("sMicProc").value in DB.VoiceDetector.PROCESSING ? $("sMicProc").value : "balanced",
+      diagnostics: $("sDiag").checked,
+      ttsEngine: "browser",                                        // local server isn't built yet
       wakeLock: $("sWakeLock").checked,
-      face: $("sFace").value === "eye" ? "eye" : "ball",
+      face: $("sFace").value === "eye" ? "eye" : "sphere",
       sleepyMinutes: Math.max(1, Math.min(120, Math.round(num("sSleepy", 3)))),
     });
     const key = $("sKey").value; $("sKey").value = "";
@@ -550,6 +810,14 @@
   function applySettings(prev) {
     stt.setLang(settings.lang);
     if (settings.face !== prev.face) setFace(settings.face);
+    const procChanged = applyVadSettings();
+    const engineChanged = engineFor(settings) !== stt.kind || (isWhisper() && settings.whisperModel !== prev.whisperModel);
+    if (settings.srMode !== prev.srMode) { if (settings.srMode !== "auto") DB.store.setLearnedStrategy(""); }
+    if (engineChanged || settings.srMode !== prev.srMode) {
+      switchEngine();
+      if (st.started && settings.listenMode === "always") { if (!isWhisper() && st.strategy === "continuous") runContinuous(); else { if (procChanged) vad.stop(); vad.stop(); ensureMic(); } }
+    } else if (procChanged && vad.running) { vad.stop(); ensureMic(); }
+    showDiag();
     if (st.started) {
       if (settings.listenMode !== prev.listenMode) {
         if (settings.listenMode === "always") ensureMic();
@@ -557,7 +825,7 @@
       }
       if (settings.camera !== prev.camera) {
         if (settings.camera === "off") cam.stop();
-        else cam.start(settings.camera).catch((e) => showSaid("Camera: " + (e.message || e.name))).then(updateCamButtons);
+        else startCamera(settings.camera).then((ok) => { if (!ok) showSaid(cameraNote(), true); });
       }
       if (settings.wakeLock) requestWakeLock(); else releaseWakeLock();
     }
@@ -594,6 +862,80 @@
     if (DB.store.notes().length && confirm("Delete all notes on this device?")) { DB.store.clearNotes(); renderNotes(); }
   });
 
+  /* ---------------- diagnostics strip ---------------- */
+  const lvlPos = (v) => Math.max(0, Math.min(1, (Math.log10(Math.max(v, 1e-4)) + 4) / 3.3));   // 0.0001 .. 0.2, log scale
+  function micState() {
+    if (!st.started) return "not started";
+    if (settings.listenMode === "off") return "mic off (settings)";
+    if (tts.speaking) return "muted while speaking";
+    if (muted()) return "muted (tail after speaking)";
+    if (isWhisper()) {
+      if (stt.state === "loading") return "loading model " + progressText();
+      if (stt.running) return "voice: recording";
+      if (stt.pending) return "transcribing";
+      if (stt.armed) return "waiting for your voice";
+    } else {
+      if (stt.running) return st.strategy === "continuous" ? "recognising (continuous)" : "recognising";
+      if (st.pendingStart) return "cooldown";
+    }
+    if (vad.inSpeech) return "voice";
+    if (vad.running) return "idle";
+    if (settings.listenMode === "tap") return "idle (tap to talk)";
+    return "mic closed";
+  }
+  function engineText() {
+    if (isWhisper()) {
+      const m = String(settings.whisperModel).replace(/^.*whisper-/, "");
+      const i = stt.info ? ", " + stt.info.device + " " + stt.info.dtype : "";
+      const lat = stt.lastMs ? ", last " + (stt.lastMs / 1000).toFixed(1) + " s" : "";
+      return "On-device Whisper (" + m + i + lat + (stt.state === "error" ? ", failed: " + stt.error : "") + ")";
+    }
+    const how = { shared: "shared mic", release: "mic released while recognising", continuous: "continuous fallback (beeps)" }[st.strategy];
+    return "Web Speech: " + how + (settings.srMode === "auto" ? " (auto)" : " (forced)") + (st.srFails ? ", " + st.srFails + " miss" : "");
+  }
+  function showDiag() { $("diag").hidden = !settings.diagnostics; }
+  function updateDiag() {
+    if (!settings.diagnostics) return;
+    const live = vad.running;
+    $("dLvl").style.width = live ? (lvlPos(vad.level) * 100).toFixed(1) + "%" : "0%";
+    $("dTh").style.left = (lvlPos(vad.threshold) * 100).toFixed(1) + "%";
+    $("dTh").hidden = !live;
+    $("dLvl").className = vad.inSpeech ? "voice" : vad.level > vad.threshold ? "over" : "";
+    $("dState").textContent = micState();
+    $("dEngine").textContent = engineText();
+    $("dNums").textContent = live ? "level " + vad.level.toFixed(4) + " · threshold " + vad.threshold.toFixed(4) + " · floor " + vad.floor.toFixed(4) + (vad.ctx && vad.ctx.state !== "running" ? " · audio " + vad.ctx.state : "")
+      : (st.strategy === "continuous" && !isWhisper() ? "no level meter in continuous mode (recognition has the mic)" : "mic level: not measuring");
+    const ev = st.events[st.events.length - 1];
+    $("dEvent").textContent = ev ? "last event: " + ev.name + " (" + Math.max(0, Math.round((Date.now() - ev.at) / 100) / 10) + " s ago)" : "last event: none yet";
+    $("dText").textContent = "last heard: " + (st.lastTranscript ? "\u201c" + st.lastTranscript + "\u201d" : "nothing yet");
+    $("dCam").textContent = cam.on ? "camera: on · " + cam.faceDetection + " · light " + cam.light + (cam.present ? " · someone here" : "") : "camera: " + (st.camError ? st.camError : "off");
+  }
+  setInterval(updateDiag, 150);
+  showDiag();
+
+  /* Calibrate: measure the room for 2 s, then your voice for 3 s, and put the threshold between them. */
+  async function calibrate() {
+    if (!st.started) await start();
+    if (!vad.running) { await ensureMic(true); }
+    if (!vad.running) { showSaid("I need the microphone to calibrate.", true); return; }
+    stopSpeaking();
+    st.muteUntil = Date.now() + 6000; vad.setMuted(true);       // don't react while calibrating
+    showSaid("Calibrating: stay quiet for a moment…", true);
+    await new Promise((r) => setTimeout(r, 300));
+    const quiet = await vad.measure(2000);
+    showSaid("Now talk normally for three seconds, like you would to me…", true);
+    const loud = await vad.measure(3000);
+    st.muteUntil = 0; updateMute();
+    const noise = Math.max(0.0002, quiet.p50), speech = loud.p90;
+    if (!(speech > noise * 1.8)) {
+      showSaid("I couldn't hear a clear difference between quiet and talking (room " + noise.toFixed(4) + ", voice " + speech.toFixed(4) + "). Try again a bit closer.", true);
+      return;
+    }
+    settings = Object.assign({}, settings, { micCal: { noise, speech, at: new Date().toISOString() } });
+    DB.store.saveSettings(settings); applyVadSettings();
+    showSaid("Calibrated: room " + noise.toFixed(4) + ", voice " + speech.toFixed(4) + ". I'll start listening above " + vad.threshold.toFixed(4) + ".", true);
+  }
+
   /* ---------------- start ---------------- */
   async function start() {
     if (st.started) return;
@@ -601,16 +943,16 @@
     $("startOverlay").hidden = true;
     activity("tap");
     requestWakeLock();
+    if (isWhisper()) stt.load();                  // first time: downloads the model (then it's cached)
     ensureMic();          // "always" mode: open the mic stream once; recognition only starts when a voice is heard
-    if (settings.camera !== "off") {
-      try { await cam.start(settings.camera); } catch (e) { showSaid("Camera: " + (e.message || e.name)); }
-    }
+    if (settings.camera !== "off") await startCamera(settings.camera);
     updateCamButtons();
     eye.setMood("happy", 2.5);
     const hi = !DB.store.getKey() ? "Hi! Add a Claude API key in settings so I can think."
       : settings.listenMode === "always" ? 'Hi! Say "' + settings.wakeWord + '" when you need me.'
       : "Hi! Press the microphone when you need me.";
-    say(hi, true);
+    await say(hi, true);
+    if (st.camError) showSaid(cameraNote(), true);
     idleStatus();
   }
   $("btnStart").addEventListener("click", start);
@@ -618,6 +960,8 @@
   if (!stt.supported) showSaid("Speech recognition isn't available in this browser. Use Chrome; the buttons still work.", true);
 
   wireSTT(); wireTTS(); fillVoices(); updateCamButtons(); idleStatus();
+  // resume a suspended audio context on any touch (some phones suspend it)
+  window.addEventListener("pointerdown", () => { if (vad.ctx && vad.ctx.state === "suspended") vad.ctx.resume().catch(() => {}); }, true);
 
   if ("serviceWorker" in navigator && window.isSecureContext) {
     window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
@@ -625,5 +969,6 @@
 
   // For debugging and the automated tests. Nothing here exposes the API key.
   window.deskBuddy = { get eye() { return eye; }, setFace, cam, brain, vad, get stt() { return stt; }, get tts() { return tts; }, get settings() { return settings; },
-                       state: st, handleFinal, runCommand, afterWake, isEcho, echoScore, muted, startRecognition, showHeard, showSaid, start };
+                       state: st, handleFinal, runCommand, afterWake, isEcho, echoScore, muted, startRecognition, showHeard, showSaid, start,
+                       say, micState, engineText, calibrate, maybeGlance, runContinuous, srFailure, get strategy() { return st.strategy; } };
 })();

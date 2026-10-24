@@ -6,6 +6,7 @@
   const K_SETTINGS = "deskbuddy.settings.v1";
   const K_KEY = "deskbuddy.apiKey";
   const K_NOTES = "deskbuddy.notes.v1";
+  const K_STRATEGY = "deskbuddy.srStrategy";   // what worked for Web Speech on this device
 
   const DEFAULT_SYSTEM =
     "You are Desk Buddy, a small round-eyed robot that lives on Vivek's desk. " +
@@ -20,7 +21,8 @@
     effort: "low",
     system: DEFAULT_SYSTEM,
     memory: 6,
-    face: "ball",            // "ball" (Round ball) or "eye" (Classic eye)
+    v: 4,                    // settings version (for migrations)
+    face: "sphere",          // "sphere" (default) or "eye" (Classic eye)
     name: "Buddy",           // shown in the captions as "Buddy: ..."
     wakeWord: "Jarvis",
     listenMode: "always",    // "always" (voice-activated), "tap" (tap to talk only), "off"
@@ -29,10 +31,21 @@
     voiceURI: "",
     rate: 1.05,
     pitch: 1.1,
-    camera: "off",
-    motion: true,
+    camera: "user",          // camera on at start: "user" (front), "environment" (back) or "off"
+    motion: true,            // eyes follow motion / a face
     preview: false,
-    sttEngine: "browser",
+    faceDetect: true,        // use the browser's FaceDetector where it exists (on-device)
+    greetHi: false,          // say "hi" when someone comes back (at most every greetMinutes)
+    greetMinutes: 10,
+    glances: "off",          // curious glances: "off" | "show" | "speak" (sends one small photo to Claude)
+    glanceMinutes: 10,
+    sttEngine: "auto",       // "auto" (Web Speech with fallbacks) | "browser" (Web Speech) | "whisper" (on-device)
+    whisperModel: "Xenova/whisper-tiny.en",
+    srMode: "auto",          // Web Speech mic strategy: "auto" | "shared" | "release" | "continuous"
+    sensitivity: 6,          // voice detector, 1..10
+    micProcessing: "balanced",
+    micCal: null,            // {noise, speech} measured by "Calibrate microphone"
+    diagnostics: true,
     ttsEngine: "browser",
     localUrl: "",
     wakeLock: true,
@@ -53,7 +66,17 @@
       delete saved.alwaysListen; delete saved.barge;
       const s = Object.assign({}, DEFAULTS, saved);
       if (!["always", "tap", "off"].includes(s.listenMode)) s.listenMode = "always";
-      if (s.face !== "eye") s.face = "ball";
+      // v4: the Round ball was replaced by the Sphere; the camera is on at start; Web Speech becomes "auto".
+      if (!(saved.v >= 4)) {
+        if (s.camera === "off") s.camera = "user";
+        if (s.sttEngine === "browser" || s.sttEngine === "local") s.sttEngine = "auto";
+        s.v = 4;
+      }
+      if (s.face !== "eye") s.face = "sphere";
+      if (!["auto", "browser", "whisper"].includes(s.sttEngine)) s.sttEngine = "auto";
+      if (!["auto", "shared", "release", "continuous"].includes(s.srMode)) s.srMode = "auto";
+      if (!["off", "show", "speak"].includes(s.glances)) s.glances = "off";
+      s.sensitivity = Math.max(1, Math.min(10, +s.sensitivity || 6));
       return s;
     },
     saveSettings(s) {
@@ -61,6 +84,8 @@
       for (const k of Object.keys(DEFAULTS)) copy[k] = s[k];   // only known keys, never the API key
       localStorage.setItem(K_SETTINGS, JSON.stringify(copy));
     },
+    learnedStrategy() { return localStorage.getItem(K_STRATEGY) || ""; },
+    setLearnedStrategy(v) { if (v) localStorage.setItem(K_STRATEGY, v); else localStorage.removeItem(K_STRATEGY); },
     getKey() { return localStorage.getItem(K_KEY) || ""; },
     setKey(k) { if (k) localStorage.setItem(K_KEY, k.trim()); },
     clearKey() { localStorage.removeItem(K_KEY); },
