@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#0a0e1e">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="description" content="Desk Buddy: a round-eyed desk companion that listens, talks and looks, powered by Claude.">
+  <title>Desk Buddy</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <canvas id="eye" aria-label="Animated eye. Tap to pet, or tap while it talks to stop it."></canvas>
+
+  <div id="status" aria-live="polite">
+    <span id="micDot" class="dot off" title="Microphone"></span>
+    <span id="statusText">Tap to start</span>
+  </div>
+
+  <div id="captions">
+    <div id="heard" class="line heard"></div>
+    <div id="said" class="line said"></div>
+  </div>
+
+  <video id="preview" playsinline muted autoplay hidden></video>
+
+  <nav id="controls" aria-label="Controls">
+    <button id="btnTalk" class="big" title="Push to talk (or press space)" aria-label="Push to talk">🎙️</button>
+    <button id="btnLook" title="Look at what the camera sees" aria-label="Look">👁️</button>
+    <button id="btnCam" title="Camera on or off" aria-label="Camera on or off">📷</button>
+    <button id="btnFlip" title="Front or back camera" aria-label="Switch camera">🔄</button>
+    <button id="btnNotes" title="Notes" aria-label="Notes">📝</button>
+    <button id="btnFull" title="Full screen" aria-label="Full screen">⛶</button>
+    <button id="btnSettings" title="Settings" aria-label="Settings">⚙️</button>
+  </nav>
+
+  <div id="startOverlay">
+    <div class="card">
+      <h1>Desk Buddy</h1>
+      <p>Tap to wake me up. I'll ask for the microphone, and for the camera if you've switched it on in settings.</p>
+      <button id="btnStart" class="primary">Start</button>
+      <p id="secureWarn" class="warn" hidden>This page isn't on HTTPS or localhost, so the browser will block the microphone and camera. Open it over HTTPS or from localhost.</p>
+    </div>
+  </div>
+
+  <dialog id="settingsDlg">
+    <form method="dialog" id="settingsForm">
+      <h2>Settings</h2>
+
+      <fieldset>
+        <legend>Claude</legend>
+        <label>API key
+          <input id="sKey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-…">
+        </label>
+        <div class="row">
+          <span id="keyState" class="muted"></span>
+          <button type="button" id="btnClearKey" class="danger">Clear key</button>
+        </div>
+        <p class="warn">The key is stored only in this browser's local storage on this device, and is sent only to api.anthropic.com. Anyone who can use this device or browser profile can read it. Use a separate key with a low spend limit set in the Claude Console.</p>
+        <label>Model
+          <input id="sModel" list="modelList" autocomplete="off" spellcheck="false">
+          <datalist id="modelList">
+            <option value="claude-sonnet-5-5">Claude Sonnet 5.5 (default)</option>
+            <option value="claude-haiku-5-5">Claude Haiku 5.5 (fastest, cheapest)</option>
+            <option value="claude-opus-5-5">Claude Opus 5.5</option>
+          </datalist>
+        </label>
+        <label>Effort (lower is faster)
+          <select id="sEffort">
+            <option value="low">Low (fastest, good for chat)</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="">Don't send (model default; use for older models)</option>
+          </select>
+        </label>
+        <label>Personality (system prompt)
+          <textarea id="sSystem" rows="6"></textarea>
+        </label>
+        <button type="button" id="btnResetSystem">Reset personality</button>
+        <label>Conversation memory (exchanges kept)
+          <input id="sMemory" type="number" min="0" max="20" step="1">
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Listening</legend>
+        <label>Wake word
+          <input id="sWake" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="check"><input id="sAlwaysListen" type="checkbox"> Listen all the time for the wake word</label>
+        <label>Speech language
+          <input id="sLang" autocomplete="off" spellcheck="false" placeholder="en-AU">
+        </label>
+        <label>Stop talking when I…
+          <select id="sBarge">
+            <option value="wake">say the wake word or "stop", or tap (best on phones)</option>
+            <option value="any">say anything, or tap (use headphones, or it hears itself)</option>
+            <option value="tap">tap only</option>
+          </select>
+        </label>
+        <label>Follow-up window after a reply (seconds, no wake word needed)
+          <input id="sFollow" type="number" min="0" max="30" step="1">
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Voice</legend>
+        <label>Voice
+          <select id="sVoice"></select>
+        </label>
+        <label>Rate <output id="oRate"></output>
+          <input id="sRate" type="range" min="0.5" max="2" step="0.05">
+        </label>
+        <label>Pitch <output id="oPitch"></output>
+          <input id="sPitch" type="range" min="0" max="2" step="0.05">
+        </label>
+        <button type="button" id="btnTestVoice">Test voice</button>
+      </fieldset>
+
+      <fieldset>
+        <legend>Camera</legend>
+        <label>Camera
+          <select id="sCamera">
+            <option value="off">Off until I press Look</option>
+            <option value="user">Front camera, on at start</option>
+            <option value="environment">Back camera, on at start</option>
+          </select>
+        </label>
+        <label class="check"><input id="sMotion" type="checkbox"> Follow motion with the eye (the camera must be on)</label>
+        <label class="check"><input id="sPreview" type="checkbox"> Show a small camera preview</label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Speech engines</legend>
+        <label>Speech to text
+          <select id="sSttEngine">
+            <option value="browser">Browser (Web Speech API)</option>
+            <option value="local" disabled>Local server: faster-whisper (coming later)</option>
+          </select>
+        </label>
+        <label>Text to speech
+          <select id="sTtsEngine">
+            <option value="browser">Browser (speechSynthesis)</option>
+            <option value="local" disabled>Local server: Kokoro (coming later)</option>
+          </select>
+        </label>
+        <label>Local server URL
+          <input id="sLocalUrl" disabled placeholder="https://192.168.1.20:8443 (not used yet)">
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Screen</legend>
+        <label class="check"><input id="sWakeLock" type="checkbox"> Keep the screen on</label>
+        <label>Get sleepy after (minutes idle)
+          <input id="sSleepy" type="number" min="1" max="120" step="1">
+        </label>
+      </fieldset>
+
+      <p class="muted small">The microphone and camera only work over HTTPS or on localhost. In Chrome, speech recognition is processed by Google's servers.</p>
+
+      <div class="row end">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button id="btnSaveSettings" value="save" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="notesDlg">
+    <form method="dialog">
+      <h2>Notes</h2>
+      <ul id="notesList"></ul>
+      <p id="notesEmpty" class="muted">No notes yet. Say "Jarvis, take a note: buy milk".</p>
+      <div class="row end">
+        <button type="button" id="btnClearNotes" class="danger">Delete all</button>
+        <button type="button" id="btnExportNotes">Export .md</button>
+        <button value="close" class="primary">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="js/store.js"></script>
+  <script src="js/eye.js"></script>
+  <script src="js/adapters.js"></script>
+  <script src="js/camera.js"></script>
+  <script src="js/brain.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
