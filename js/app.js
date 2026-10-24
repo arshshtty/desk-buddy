@@ -54,6 +54,8 @@
   const TAIL_MS = 800;          // keep ignoring the mic this long after Buddy stops talking
   const BARGE_TAIL_MS = 300;    // shorter when the speech was cut off by a tap
   const ECHO_WINDOW_MS = 120000;
+  const STUCK_SPEAK_MS = 120000;  // no single reply is spoken for this long
+  const STUCK_PHASE_MS = 60000;
 
   const st = {
     started: false,
@@ -88,7 +90,13 @@
     greets: 0,
     lastGlanceAsk: 0,
     glances: 0,
+    lastHint: 0,
+    lastSpokeEnd: 0,
+    phase: "idle",          // "idle" | "heard" | "thinking" | "speaking", for the diagnostics strip and the watchdog
+    phaseAt: Date.now(),
+    lastReply: "",          // what happened to the last command: "spoken", "caption only (…)", an error
   };
+  function setPhase(p) { if (st.phase !== p) { st.phase = p; st.phaseAt = Date.now(); } }
   function pickStrategy() {
     st.strategy = settings.srMode !== "auto" ? settings.srMode : (DB.store.learnedStrategy() || "shared");
     st.srFails = 0;
@@ -147,23 +155,59 @@
     return d[m][n];
   }
   const near = (heard, want) => heard === want || (want.length >= 5 && lev(heard, want) <= 1);
+  // Consonant skeleton: how a word sounds, roughly. "Jarvis", "Jervis", "Charvis", "Jarvis's" -> "jrvs";
+  // "service" -> "srvs", "travis" -> "trvs", "arvis" -> "rvs".
+  function skeleton(w) {
+    let x = String(w).toLowerCase().replace(/'s$/, "").replace(/[^a-z]/g, "");
+    x = x.replace(/^(dj|ch|sh|zh|j|g(?=[eiy]))/, "j").replace(/ph/g, "f").replace(/ck/g, "k")
+         .replace(/c(?=[eiy])/g, "s").replace(/[cqk]/g, "k").replace(/z/g, "s").replace(/w/g, "v").replace(/x/g, "ks");
+    const first = x[0] || "";
+    x = x.slice(1).replace(/[aeiouyh]/g, "");
+    x = (/[aeiouy]/.test(first) ? "" : first) + x;
+    return x.replace(/(.)\1+/g, "$1");
+  }
   // Recognition starts a moment after you start speaking (on Android it can't be given the audio from
-  // before it started), so the first syllable of the wake word can be lost: "Jarvis" -> "arvis"/"service",
-  // "Buddy" -> "daddy". At the start of an utterance we accept a clipped or slightly wrong wake word.
-  const nearLoose = (heard, want) => near(heard, want) ||
-    (want.length >= 4 && lev(heard, want) <= 2) ||
-    (heard.length >= 3 && want.length - heard.length <= 3 && want.endsWith(heard)) ||
-    (want.length >= 5 && heard.length >= 3 && lev(heard, want.slice(Math.max(1, want.length - heard.length))) <= 1);
+  // before it started), so the first syllable of the wake word can be lost, and Whisper-tiny mishears
+  // names: "Jarvis" -> "arvis"/"service"/"Jervis"/"travis"/"Charvis", "Buddy" -> "daddy". At the start of
+  // an utterance (or after "hey"/"ok") we accept a clipped, misheard or similar-sounding wake word.
+  function nearLoose(heard, want) {
+    if (near(heard, want)) return true;
+    heard = heard.replace(/'s$/, "");
+    if (want.length >= 4 && lev(heard, want) <= 2) return true;
+    if (heard.length >= 3 && want.length - heard.length <= 3 && want.endsWith(heard)) return true;
+    if (want.length >= 5 && heard.length >= 3 && lev(heard, want.slice(Math.max(1, want.length - heard.length))) <= 1) return true;
+    const h = skeleton(heard), w = skeleton(want);
+    if (!h || !w) return false;
+    if (h === w && w.length >= 2) return true;
+    if (w.length >= 4 && h.length >= 3 && lev(h, w) <= 1) return true;          // jrvs ~ srvs, trvs, jrvst
+    if (w.length >= 4 && h.length >= 3 && w.endsWith(h)) return true;           // rvs: first sound lost
+    return false;
+  }
+  const nearMid = (heard, want) => near(heard, want) || (want.length >= 4 && lev(heard.replace(/'s$/, ""), want) <= 2) ||
+    (skeleton(want).length >= 3 && skeleton(heard) === skeleton(want));
+  const GREET_RE = /^(hey|hi|hello|ok|okay|oi|yo|hiya|ey|a|uh|um|oh|so|right|excuse)$/;
   /** Returns the words after the wake word, "" if it was said alone, or null if it wasn't said. */
   function afterWake(text) {
     const wt = tokens(settings.wakeWord), tt = tokens(text);
     if (!wt.length) return null;
-    for (let i = 0; i + wt.length <= tt.length; i++) {
-      // loose matching only for the first word, or the second after "hey"/"ok"/"hi"
-      const loose = i === 0 || (i === 1 && /^(hey|hi|ok|okay|oi|yo)$/.test(tt[0]));
-      if (wt.every((w, j) => (loose && j === 0 ? nearLoose : near)(tt[i + j], w))) return tt.slice(i + wt.length).join(" ");
+    for (let i = 0; i + 1 <= tt.length; i++) {
+      // loose matching for the first word of the wake word in the first three words, or after "hey"/"ok"/"hi"
+      // At the very start (or after "hey"/"ok"/"um"): anything that sounds like it. Second or third word: only a
+      // near spelling or the same sound, so "the service was slow" isn't taken for "Jarvis".
+      const loose = i === 0 || GREET_RE.test(tt[i - 1] || "");
+      const first = loose ? nearLoose : i <= 2 ? nearMid : near;
+      if (i + wt.length <= tt.length && wt.every((w, j) => (j === 0 ? first : near)(tt[i + j], w))) return tt.slice(i + wt.length).join(" ");
+      // a one-word wake word split in two ("jar vis", "her vis")
+      if (loose && wt.length === 1 && i + 1 < tt.length && tt[i].length <= 4 && (tt[i] + tt[i + 1]).length >= 4 && nearLoose(tt[i] + tt[i + 1], wt[0]))
+        return tt.slice(i + 2).join(" ");
     }
     return null;
+  }
+  /** Does this utterance need the wake word right now? */
+  function wakeNeeded() {
+    if (settings.wakeMode === "off") return false;
+    if (settings.wakeMode === "conversation") return !(cam.on && cam.present);
+    return true;
   }
 
   /* Echo filter: a transcript made mostly of words Buddy just said is Buddy hearing itself. */
@@ -186,7 +230,9 @@
     if (!said.size) return 0;
     return t.filter((w) => said.has(w)).length / t.length;
   }
-  const isEcho = (text) => echoScore(text) > 0.5;
+  // Real echo arrives while Buddy talks (ignored anyway) or just after. Later, only a near-copy counts, so a
+  // follow-up that reuses Buddy's words ("what about the weather tomorrow?") isn't thrown away.
+  const isEcho = (text) => { const sc = echoScore(text); return Date.now() - (st.lastSpokeEnd || 0) < 5000 ? sc > 0.5 : sc >= 0.85; };
   const muted = () => tts.speaking || Date.now() < st.muteUntil;
   const STOP_RE = /^(stop|stop it|stop talking|be quiet|quiet|shut up|enough|never mind|nevermind|cancel|ok stop|okay stop)\b/i;
 
@@ -389,12 +435,18 @@
         setTimeout(() => { if (Date.now() >= st.awaitUntil) { eye.setListening(listeningForCommand()); idleStatus(); } }, 8100);
         return "wake";
       }
-    } else if (listeningForCommand()) { activity("speech"); showHeard(text); cmd = text; }
-    if (cmd == null) {                      // not for Buddy (no wake word): show it faintly, do nothing
+    } else if (listeningForCommand() || !wakeNeeded()) { activity("speech"); showHeard(text); cmd = text; }
+    if (cmd == null) {                      // not for Buddy (no wake word): show it faintly, and say why
       st.drops.ignored++;
       showHeard(text, true);
+      logEvent("ignored: no wake word");
+      if (now - st.lastHint > 12000 && !tts.speaking && !brain.busy) {
+        st.lastHint = now;
+        showSaid('I heard you, but not "' + settings.wakeWord + '". Say "' + settings.wakeWord + '" first, or turn off "Require the wake word" in Settings.', true);
+      }
       return "ignored";
     }
+    setPhase("heard");
     st.awaitUntil = st.pttUntil = st.followUntil = 0;
     eye.setListening(false);
     $("btnTalk").classList.remove("active");
@@ -414,6 +466,7 @@
     cmd = String(cmd).trim();
     if (!cmd) return;
     activity("speech");
+    setPhase("heard");
     if (st.noteArmed) {
       st.noteArmed = false;
       const n = DB.store.addNote(cmd);
@@ -462,6 +515,7 @@
 
   async function ask(text, image) {
     const my = ++st.askToken;
+    setPhase("thinking");
     eye.setMood("thinking"); idleStatus();
     try {
       const reply = await brain.ask(text, image);
@@ -471,9 +525,11 @@
     } catch (e) {
       if (my !== st.askToken) return;
       eye.setMood("surprised", 2);
-      const msg = e instanceof DB.BrainError ? e.message : "Something went wrong.";
+      // Never swallow an error: say it, caption it, and put it in the diagnostics strip.
+      const msg = e instanceof DB.BrainError ? e.message : "Something went wrong: " + ((e && (e.message || e.name)) || "unknown error");
+      logEvent("claude: " + (e && e.kind ? e.kind : "error"));
       await say(msg, true);
-    } finally { idleStatus(); }
+    } finally { if (my === st.askToken && st.phase === "thinking") setPhase("idle"); idleStatus(); }
   }
 
   /* ---------------- speech out ---------------- */
@@ -486,11 +542,13 @@
       vad.setMuted(true);
       abortSTT();
       if ($("heard").classList.contains("partial")) showHeard("");
-      eye.setSpeaking(true); idleStatus();
+      eye.setSpeaking(true); setPhase("speaking"); idleStatus();
     };
     tts.onWord = () => eye.pulse();
     tts.onEnd = () => {
       eye.setSpeaking(false);
+      st.lastSpokeEnd = Date.now();
+      if (st.phase === "speaking") setPhase("idle");
       const tail = st.bargeAt && Date.now() - st.bargeAt < 200 ? BARGE_TAIL_MS : TAIL_MS;
       st.bargeAt = 0;
       st.muteUntil = Date.now() + tail;
@@ -499,12 +557,19 @@
       idleStatus();
     };
     tts.onVoices = () => fillVoices();
+    tts.onError = (msg) => { logEvent("voice out: " + msg); };
   }
   async function say(text, noFollow) {
-    showSaid(text);
-    if (!tts.supported) return;
+    showSaid(text);                       // the caption always shows, whatever happens to the voice
     rememberSaid(text);
-    await tts.speak(text, { voice: settings.voiceURI, rate: +settings.rate, pitch: +settings.pitch, lang: settings.lang });
+    const errBefore = tts.lastErrorAt || 0;
+    if (tts.supported) {
+      try { await tts.speak(text, { voice: settings.voiceURI, rate: +settings.rate, pitch: +settings.pitch, lang: settings.lang }); }
+      catch (e) { logEvent("voice out: " + ((e && e.message) || "failed")); }
+      st.lastReply = (tts.lastErrorAt || 0) <= errBefore ? "spoken"
+        : /didn't report its end/.test(tts.lastError) ? "spoken, but the end wasn't reported" : "caption only (" + tts.lastError + ")";
+    } else st.lastReply = "caption only (this browser can't speak)";
+    if (st.phase === "heard") setPhase("idle");
     if (!noFollow && settings.followUp > 0 && st.started && settings.listenMode === "always") {
       const ms = TAIL_MS + settings.followUp * 1000;
       st.followUntil = Date.now() + ms;
@@ -664,7 +729,7 @@
       const image = await cam.grab(320, 0.6);
       st.glances++;
       const r = await brain.ask("(Curious glance: nobody asked you anything. Look at this camera picture and make one short, friendly, " +
-        "playful remark about something you notice, in under 15 words. Don't ask a question.)", image, { noHistory: true, maxTokens: 120 });
+        "playful remark about something you notice, in under 15 words. Don't ask a question.)", image, { noHistory: true, maxTokens: 300 });
       if (tts.speaking || listeningForCommand()) return;
       eye.setMood(r.mood || "curious", 4);
       if (settings.glances === "speak") say(r.text, true); else showSaid(r.text, true);
@@ -698,6 +763,16 @@
   }
 
   /* ---------------- idle behaviour ---------------- */
+  // Watchdog: no state may stick. Speaking with no end, or a mute that outlived the speech, would keep the
+  // mic deaf for ever; "thinking" can't outlast the brain's own 45 s timeout.
+  setInterval(() => {
+    const now = Date.now();
+    if (tts.speaking && tts.started && now - tts.started > STUCK_SPEAK_MS) { logEvent("watchdog: speech stuck, stopped it"); tts.cancel(); }
+    if (!tts.speaking && st.muteUntil === Infinity) { st.muteUntil = now + TAIL_MS; st.mutePending = true; setTimeout(updateMute, TAIL_MS + 10); }
+    if ((st.phase === "thinking" && !brain.busy && now - st.phaseAt > 3000) || (st.phase !== "idle" && now - st.phaseAt > STUCK_PHASE_MS)) {
+      logEvent("watchdog: stuck in " + st.phase + ", back to idle"); setPhase("idle"); idleStatus();
+    }
+  }, 1000);
   setInterval(() => {
     if (!st.started) return;
     const now = Date.now(), idle = now - st.lastActivity;
@@ -737,7 +812,7 @@
     const s = settings;
     $("sKey").value = "";
     $("sModel").value = s.model; $("sEffort").value = s.effort; $("sSystem").value = s.system; $("sMemory").value = s.memory;
-    $("sWake").value = s.wakeWord; $("sListenMode").value = s.listenMode; $("sLang").value = s.lang;
+    $("sWake").value = s.wakeWord; $("sWakeMode").value = s.wakeMode; $("sListenMode").value = s.listenMode; $("sLang").value = s.lang;
     $("sName").value = s.name; $("sFollow").value = s.followUp;
     fillVoices();
     $("sRate").value = s.rate; $("sPitch").value = s.pitch; $("oRate").textContent = (+s.rate).toFixed(2); $("oPitch").textContent = (+s.pitch).toFixed(2);
@@ -779,6 +854,7 @@
       system: $("sSystem").value.trim() || DB.store.DEFAULT_SYSTEM,
       memory: Math.max(0, Math.min(20, Math.round(num("sMemory", 6)))),
       wakeWord: $("sWake").value.trim() || DB.store.DEFAULTS.wakeWord,
+      wakeMode: ["on", "conversation", "off"].includes($("sWakeMode").value) ? $("sWakeMode").value : "on",
       listenMode: ["always", "tap", "off"].includes($("sListenMode").value) ? $("sListenMode").value : "always",
       name: $("sName").value.trim() || DB.store.DEFAULTS.name,
       lang: $("sLang").value.trim() || DB.store.DEFAULTS.lang,
@@ -908,6 +984,13 @@
     const ev = st.events[st.events.length - 1];
     $("dEvent").textContent = ev ? "last event: " + ev.name + " (" + Math.max(0, Math.round((Date.now() - ev.at) / 100) / 10) + " s ago)" : "last event: none yet";
     $("dText").textContent = "last heard: " + (st.lastTranscript ? "\u201c" + st.lastTranscript + "\u201d" : "nothing yet");
+    const b = brain.last, nv = tts.voices().length;
+    $("dReply").textContent = "reply: " + st.phase + (st.phase !== "idle" ? " " + Math.round((Date.now() - st.phaseAt) / 1000) + " s" : "") +
+      " · wake word " + (settings.wakeMode === "on" ? "required" : settings.wakeMode === "off" ? "off" : wakeNeeded() ? "required (nobody on camera)" : "not needed (someone's here)") +
+      (listeningForCommand() ? " · follow-up open" : "") +
+      " · claude " + (!DB.store.getKey() ? "no key" : b ? (b.ok ? "ok " + (b.ms / 1000).toFixed(1) + " s" : b.text.slice(0, 90)) : "not asked yet") +
+      " · voice out " + (tts.supported ? (tts.voiceUsed || "default") + ", " + nv + " voices" + (st.lastReply ? ", last " + st.lastReply : "") +
+        (tts.lastError && Date.now() - tts.lastErrorAt < 120000 ? ", error: " + tts.lastError : "") : "unsupported");
     $("dCam").textContent = cam.on ? "camera: on · " + cam.faceDetection + " · light " + cam.light + (cam.present ? " · someone here" : "") : "camera: " + (st.camError ? st.camError : "off");
   }
   setInterval(updateDiag, 150);
@@ -939,6 +1022,7 @@
   /* ---------------- start ---------------- */
   async function start() {
     if (st.started) return;
+    tts.unlock();                         // must happen inside the tap: Android won't speak otherwise
     st.started = true;
     $("startOverlay").hidden = true;
     activity("tap");
@@ -961,7 +1045,7 @@
 
   wireSTT(); wireTTS(); fillVoices(); updateCamButtons(); idleStatus();
   // resume a suspended audio context on any touch (some phones suspend it)
-  window.addEventListener("pointerdown", () => { if (vad.ctx && vad.ctx.state === "suspended") vad.ctx.resume().catch(() => {}); }, true);
+  window.addEventListener("pointerdown", () => { tts.unlock(); if (vad.ctx && vad.ctx.state === "suspended") vad.ctx.resume().catch(() => {}); }, true);
 
   if ("serviceWorker" in navigator && window.isSecureContext) {
     window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
@@ -969,6 +1053,6 @@
 
   // For debugging and the automated tests. Nothing here exposes the API key.
   window.deskBuddy = { get eye() { return eye; }, setFace, cam, brain, vad, get stt() { return stt; }, get tts() { return tts; }, get settings() { return settings; },
-                       state: st, handleFinal, runCommand, afterWake, isEcho, echoScore, muted, startRecognition, showHeard, showSaid, start,
+                       state: st, handleFinal, runCommand, afterWake, skeleton, wakeNeeded, setPhase, isEcho, echoScore, muted, startRecognition, showHeard, showSaid, start,
                        say, micState, engineText, calibrate, maybeGlance, runContinuous, srFailure, get strategy() { return st.strategy; } };
 })();

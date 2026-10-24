@@ -1,7 +1,7 @@
 /* Desk Buddy service worker: caches the app shell so it opens offline and can be installed.
    API calls (api.anthropic.com) and anything off this origin are never cached here. The Whisper model files
    (from huggingface.co) are cached by transformers.js in its own cache, which this worker leaves alone. */
-const CACHE = "desk-buddy-v4";
+const CACHE = "desk-buddy-v5";
 const SHELL = [
   "./", "./index.html", "./styles.css", "./manifest.webmanifest",
   "./js/store.js", "./js/eye.js", "./js/face-sphere.js", "./js/adapters.js", "./js/whisper.js", "./js/vad.js", "./js/camera.js",

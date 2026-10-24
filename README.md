@@ -64,7 +64,7 @@ The face reacts to what it sees. All of this runs on the device from a 160×120 
 
 **Curious glances** (Settings → Camera, off by default): every N minutes while someone is in view, one 320 px picture
 goes to Claude with no conversation history, and Buddy shows or says a short remark. Roughly 100 input tokens for the
-picture (Anthropic's rule of thumb is width × height ÷ 750) plus the personality prompt and a reply of up to 120 tokens,
+picture (Anthropic's rule of thumb is width × height ÷ 750) plus the personality prompt and a reply capped at 300 output tokens (thinking included),
 so about the cost of one short question each time. These are estimates; check usage in the Claude Console.
 
 ## Listening
@@ -101,7 +101,31 @@ recognition event or error, the last transcript and the camera status.
 suppression) or raw (echo cancelling only).
 
 While Buddy is speaking, and for 800 ms after, the mic is ignored and any running recognition or transcription is dropped.
-Any transcript where more than half of the words match Buddy's last two replies is dropped as an echo.
+Within 5 s of Buddy speaking, any transcript where more than half of the words match Buddy's last two replies is dropped
+as an echo. After that, only a near-copy (85% or more) is dropped, so a follow-up that reuses Buddy's words still gets through.
+
+**Wake word.** "Require the wake word" is Yes by default. Conversation mode answers everything while someone is on camera
+(it still needs the wake word when the camera is off). No answers everything it hears. After every reply there's a follow-up
+window (8 s by default) when no wake word is needed. The match is forgiving at the start of what you say, or after
+"hey"/"ok"/"um": Android often loses the first syllable, and Whisper-tiny mishears names. So "Jarvis," "Jervis",
+"Charvis", "arvis", "service", "travis" and "jar vis" all count, but "the service was slow" doesn't. When you're heard
+without the wake word, the words show faintly with a hint: say the wake word first, or turn it off.
+
+### If it listens but doesn't answer
+
+Look at the `reply:` line in the diagnostics strip:
+- **wake word required**, with a faint "You:" caption and the hint: the wake word wasn't recognised. Start with "Hey Jarvis",
+  or set "Require the wake word" to Conversation mode or No.
+- **claude …** shows the last call: `ok 1.8 s`, or the error (`auth 401`, `rate 429`, `model 404`, `network`, …). Every error is
+  also spoken and captioned. If the model rejects the effort setting, Buddy retries once without it and stops sending it.
+- **voice out …** shows the voice used, how many voices the browser has loaded, and the last speech error. On Android Chrome:
+  - Speech is unlocked by a silent utterance in the Start tap.
+  - A voice saved on another device falls back to the default.
+  - Speech that never reports its end times out (about 4 s plus 1 s per 12 characters), so Buddy can't stay "speaking"
+    with the mic muted.
+  - The caption always shows, even when the voice fails.
+- A watchdog sends any stuck "thinking"/"speaking" state back to idle.
+- If Android ends a recognition session with only a partial (interim) result, that result is used as the transcript.
 To interrupt Buddy, tap the face or press Esc.
 
 The face blinks, wanders, yawns after a while, gets sleepy after the idle time set in settings, and falls asleep after

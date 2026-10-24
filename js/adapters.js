@@ -43,7 +43,7 @@
       if (!this.supported) { this.onState("error", "Speech recognition isn't available in this browser", "unsupported"); return false; }
       if (this.fatal || this.running) return false;
       const r = this._make(!!opts.continuous);
-      this.rec = r; this.gotResult = false; this.source = opts.source || "";
+      this.rec = r; this.gotResult = false; this.source = opts.source || ""; this.lastInterim = ""; this.aborting = false;
       this.lastStart = Date.now(); this.starts++;
       this.running = true;                       // set now so nothing else starts a second session
       let ok = false;
@@ -58,7 +58,7 @@
     /** Stop listening but return what was heard. */
     stop() { if (this.rec && this.running) { try { this.rec.stop(); } catch (e) { /* already stopped */ } } }
     /** Stop now and throw away anything heard (used when Buddy starts talking). */
-    abort() { if (this.rec && this.running) { try { this.rec.abort(); } catch (e) { /* already stopped */ } } }
+    abort() { if (this.rec && this.running) { this.aborting = true; try { this.rec.abort(); } catch (e) { /* already stopped */ } } }
     _make(continuous) {
       const r = new this.Impl();
       r.continuous = !!continuous;               // normally false: end by itself after one utterance
@@ -80,7 +80,7 @@
         this.onSpeech();
         this.onEvent(final.trim() ? "result (final)" : "result");
         if (final.trim()) { this.gotResult = true; this.onResult(final.trim(), true); }
-        else if (interim.trim()) this.onResult(interim.trim(), false);
+        else if (interim.trim()) { this.lastInterim = interim.trim(); this.onResult(interim.trim(), false); }
       };
       r.onerror = (ev) => {
         const e = ev.error;
@@ -97,6 +97,13 @@
         if (r !== this.rec) return;
         clearTimeout(this.maxTimer);
         this.running = false; this.rec = null;
+        // Android Chrome sometimes ends a session with only interim results and no final one. Use the
+        // last interim as the final transcript, unless we threw the session away ourselves.
+        if (!this.gotResult && this.lastInterim && !this.aborting) {
+          this.gotResult = true;
+          this.onEvent("end without final: used the last interim");
+          this.onResult(this.lastInterim, true);
+        }
         this.onEvent("end");
         this.onState("idle");
         this.onEnd(this.gotResult);              // no restart: the next voice onset starts a new session
@@ -105,13 +112,23 @@
     }
   }
 
-  /* ---------------- Browser speech synthesis ---------------- */
+  /* ---------------- Browser speech synthesis ----------------
+     Android Chrome quirks handled here:
+     - speak() is ignored (or silent) until the page has had a user gesture: unlock() speaks a silent
+       utterance from the Start tap.
+     - the voice list loads late (getVoices() is empty at first), and a voice saved on another device
+       doesn't exist here: fall back to the browser's default voice.
+     - long speech stops after ~15 s, and onend sometimes never fires: speak sentence-sized chunks,
+       resume() every few seconds, and a per-chunk timeout so `speaking` can never get stuck (it would
+       keep the mic muted for ever).
+     - speak() straight after cancel() is sometimes dropped: wait a moment after a real cancel. */
   class BrowserTTS {
     constructor() {
       this.synth = window.speechSynthesis || null;
       this.supported = !!(this.synth && window.SpeechSynthesisUtterance);
-      this.speaking = false; this.token = 0; this.keepAlive = 0; this.resolveCurrent = null;
-      this.onStart = noop; this.onWord = noop; this.onEnd = noop; this.onVoices = noop;
+      this.speaking = false; this.token = 0; this.keepAlive = 0; this.resolveCurrent = null; this.chunkTimer = 0;
+      this.unlocked = false; this.lastError = ""; this.lastErrorAt = 0; this.voiceUsed = ""; this.started = 0; this.timeouts = 0;
+      this.onStart = noop; this.onWord = noop; this.onEnd = noop; this.onVoices = noop; this.onError = noop;
       if (this.supported) {
         this.synth.addEventListener ? this.synth.addEventListener("voiceschanged", () => this.onVoices())
                                     : (this.synth.onvoiceschanged = () => this.onVoices());
@@ -119,7 +136,27 @@
     }
     voices() {
       if (!this.supported) return [];
-      return this.synth.getVoices().map((v) => ({ id: v.voiceURI, name: v.name, lang: v.lang, isDefault: v.default, local: v.localService }));
+      let list = [];
+      try { list = this.synth.getVoices() || []; } catch (e) { list = []; }
+      return list.map((v) => ({ id: v.voiceURI, name: v.name, lang: v.lang, isDefault: v.default, local: v.localService }));
+    }
+    /** Call from a tap (user gesture): Android Chrome won't speak until something was spoken in one. */
+    unlock() {
+      if (!this.supported || this.unlocked) return;
+      this.unlocked = true;
+      try {
+        const u = new SpeechSynthesisUtterance(" ");
+        u.volume = 0;
+        this.synth.speak(u);
+      } catch (e) { this._error("unlock failed: " + (e && (e.message || e.name))); }
+    }
+    _error(msg) { this.lastError = msg; this.lastErrorAt = Date.now(); this.onError(msg); }
+    /** The saved voice if this device has it (by id, then by name), else null = the browser default. */
+    pickVoice(id) {
+      if (!id) return null;
+      let list = [];
+      try { list = this.synth.getVoices() || []; } catch (e) { list = []; }
+      return list.find((v) => v.voiceURI === id) || list.find((v) => v.name === id) || null;
     }
     _chunks(text) {
       // Chrome cuts long utterances off after about 15 s, so speak sentence-sized pieces.
@@ -132,46 +169,72 @@
       if (cur.trim()) out.push(cur.trim());
       return out;
     }
+    /** Longest a chunk may take before we stop waiting for onend: ~12 characters a second, plus slack. */
+    static chunkLimitMs(text, rate) { return Math.round(4000 + (String(text).length / (12 * Math.max(0.5, rate || 1))) * 1000); }
     speak(text, opts) {
       opts = opts || {};
       if (!this.supported || !String(text || "").trim()) return Promise.resolve();
+      const busy = !!(this.synth.speaking || this.synth.pending);
       this.cancel();
       const my = ++this.token;
-      const voice = this.synth.getVoices().find((v) => v.voiceURI === opts.voice) || null;
+      const voice = this.pickVoice(opts.voice);
+      this.voiceUsed = voice ? voice.name : (opts.voice ? "default (saved voice not on this device)" : "default");
       const chunks = this._chunks(text);
-      this.speaking = true;
+      this.speaking = true; this.started = Date.now();
       this.onStart();
       clearInterval(this.keepAlive);
-      this.keepAlive = setInterval(() => { if (this.synth.speaking) this.synth.resume(); }, 8000);  // desktop Chrome stall workaround
+      // Chrome stall workaround: resume() only (pause()+resume() cancels speech on Android).
+      this.keepAlive = setInterval(() => { try { if (this.synth.speaking || this.synth.paused) this.synth.resume(); } catch (e) { /* ignore */ } }, 5000);
       return new Promise((resolve) => {
         this.resolveCurrent = resolve;
         const finish = () => {
           if (my !== this.token) return;
-          clearInterval(this.keepAlive);
+          clearInterval(this.keepAlive); clearTimeout(this.chunkTimer);
           this.speaking = false; this.resolveCurrent = null;
           this.onEnd(); resolve();
         };
         let i = 0;
         const next = () => {
           if (my !== this.token) return;
+          clearTimeout(this.chunkTimer);
           if (i >= chunks.length) return finish();
-          const u = new SpeechSynthesisUtterance(chunks[i++]);
+          const chunk = chunks[i++];
+          const u = new SpeechSynthesisUtterance(chunk);
           if (voice) { u.voice = voice; u.lang = voice.lang; } else if (opts.lang) u.lang = opts.lang;
           u.rate = opts.rate || 1; u.pitch = opts.pitch == null ? 1 : opts.pitch;
-          u.onboundary = (e) => { if (e.name === "word" || e.name === undefined) this.onWord(); };
-          u.onend = next;
-          u.onerror = (e) => { if (e.error === "interrupted" || e.error === "canceled") return; next(); };
-          this.synth.speak(u);
+          let done = false, began = false;
+          const go = () => { if (!done) { done = true; next(); } };
+          u.onstart = () => { began = true; };
+          u.onboundary = (e) => { began = true; if (e.name === "word" || e.name === undefined) this.onWord(); };
+          u.onend = go;
+          u.onerror = (e) => {
+            if (my !== this.token) return;             // we cancelled it ourselves
+            const code = (e && e.error) || "unknown";
+            if (code !== "interrupted" && code !== "canceled") this._error("speech error: " + code);
+            go();                                      // never get stuck on an error
+          };
+          // onend sometimes never fires on Android: move on after a generous limit.
+          this.chunkTimer = setTimeout(() => {
+            if (done || my !== this.token) return;
+            this.timeouts++;
+            this._error(began || this.synth.speaking ? "speech didn't report its end (timed out)" : "speech never started (blocked until a tap, or no voice)");
+            try { if (i >= chunks.length) this.synth.cancel(); } catch (e) { /* ignore */ }
+            go();
+          }, BrowserTTS.chunkLimitMs(chunk, opts.rate));
+          try {
+            if (this.synth.paused) this.synth.resume();
+            this.synth.speak(u);
+          } catch (e) { this._error("speak failed: " + (e && (e.message || e.name))); go(); }
         };
-        next();
+        if (busy) setTimeout(next, 80); else next();
       });
     }
     cancel() {
       if (!this.supported) return;
       const wasSpeaking = this.speaking;
       this.token++;
-      clearInterval(this.keepAlive);
-      try { this.synth.cancel(); } catch (e) { /* ignore */ }
+      clearInterval(this.keepAlive); clearTimeout(this.chunkTimer);
+      try { if (this.synth.speaking || this.synth.pending || this.synth.paused || wasSpeaking) this.synth.cancel(); } catch (e) { /* ignore */ }
       this.speaking = false;
       if (this.resolveCurrent) { const r = this.resolveCurrent; this.resolveCurrent = null; r(); }
       if (wasSpeaking) this.onEnd();
@@ -192,7 +255,8 @@
     abort() {}
   }
   class LocalServerTTS {
-    constructor() { this.supported = false; this.speaking = false; this.onStart = noop; this.onWord = noop; this.onEnd = noop; this.onVoices = noop; }
+    constructor() { this.supported = false; this.speaking = false; this.lastError = ""; this.onStart = noop; this.onWord = noop; this.onEnd = noop; this.onVoices = noop; this.onError = noop; }
+    unlock() {}
     voices() { return []; }
     speak() { return Promise.resolve(); }
     cancel() {}

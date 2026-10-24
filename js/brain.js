@@ -22,6 +22,24 @@
     constructor(kind, message) { super(message); this.kind = kind; }
   }
 
+  /** Turn an HTTP error from the Messages API into a short message Buddy can say. */
+  function classify(status, type, detail, model) {
+    const d = String(detail || "");
+    const short = d.length > 160 ? d.slice(0, 157) + "…" : d;
+    let e;
+    if (status === 401) e = new BrainError("auth", "My Claude API key was refused. Check it in settings.");
+    else if (status === 403) e = new BrainError("auth", "My Claude API key isn't allowed to do that" + (short ? ": " + short : "."));
+    else if (status === 429) e = new BrainError("rate", "I'm being rate limited by Claude. Try again in a moment.");
+    else if (status === 404 || type === "not_found_error" || /model/i.test(d) && /not.?found|does not exist|invalid model|unknown model/i.test(d))
+      e = new BrainError("model", "Claude doesn't know the model \u201c" + model + "\u201d. Pick another one in settings.");
+    else if (status === 400 && /effort|output_config/i.test(d)) e = new BrainError("effort", "Claude rejected the effort setting: " + short);
+    else if (status === 529 || status >= 500) e = new BrainError("overloaded", "Claude is busy right now. Try again in a moment.");
+    else if (status === 413) e = new BrainError("bad", "That was too big to send to Claude.");
+    else e = new BrainError("bad", "Claude said the request was invalid" + (short ? ": " + short : "."));
+    e.status = status; e.detail = d;
+    return e;
+  }
+
   /** Text for speaking: drop markdown and the leading [mood] tag. */
   function parseReply(raw) {
     let text = String(raw || "").trim();
@@ -40,6 +58,8 @@
       this.notes = notes;                // {add(text), list()}
       this.history = [];
       this.busy = false;
+      this.last = null;                  // {ok, ms, at, text}: the last call, for the diagnostics strip
+      this.noEffortFor = "";
       this.fetch = (...a) => window.fetch(...a);   // looked up at call time, so tests can mock window.fetch
     }
     forget() { this.history = []; }
@@ -68,16 +88,14 @@
         });
       } catch (e) {
         if (e && e.name === "AbortError") throw new BrainError("timeout", "Claude took too long to answer.");
-        throw new BrainError("network", "I couldn't reach Claude. Check the internet connection.");
+        // A failed fetch is a TypeError with no detail: offline, DNS, or the browser blocked it (CORS, an ad blocker).
+        throw new BrainError("network", navigator.onLine === false ? "I'm offline, so I can't reach Claude."
+          : "I couldn't reach Claude. Check the internet connection, or a blocker in the browser.");
       }
       if (!res.ok) {
-        let detail = "";
-        try { const j = await res.json(); detail = (j && j.error && j.error.message) || ""; } catch (e) { /* not JSON */ }
-        const kind = res.status === 401 || res.status === 403 ? "auth" : res.status === 429 ? "rate" :
-                     res.status === 529 || res.status >= 500 ? "overloaded" : "bad";
-        const msg = { auth: "My API key was refused. Check it in settings.", rate: "I'm being rate limited. Try again in a moment.",
-                      overloaded: "Claude is busy right now. Try again in a moment.", bad: "Claude said the request was invalid" }[kind];
-        throw new BrainError(kind, msg + (kind === "bad" && detail ? ": " + detail : "."));
+        let detail = "", type = "";
+        try { const j = await res.json(); detail = (j && j.error && j.error.message) || ""; type = (j && j.error && j.error.type) || ""; } catch (e) { /* not JSON */ }
+        throw classify(res.status, type, detail, body.model);
       }
       return res.json();
     }
@@ -111,15 +129,24 @@
       const messages = past.map((m) => ({ role: m.role, content: m.content })).concat([{ role: "user", content: userContent }]);
 
       const body = { model: s.model || DB.store.DEFAULTS.model, max_tokens: opts.maxTokens || 1024, system: this._system(s), tools: TOOLS, messages };
-      if (s.effort) body.output_config = { effort: s.effort };
+      // Effort (output_config.effort) is optional; if the model rejects it once, stop sending it for that model.
+      if (s.effort && this.noEffortFor !== body.model) body.output_config = { effort: s.effort };
 
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 45000);
       this.busy = true;
+      const t0 = Date.now();
       try {
         let rawText = "";
         for (let round = 0; round < 4; round++) {
-          const data = await this._post(body, ctrl.signal);
+          let data;
+          try { data = await this._post(body, ctrl.signal); }
+          catch (e) {
+            if (e.kind === "effort" && body.output_config) {
+              this.noEffortFor = body.model; delete body.output_config;
+              data = await this._post(body, ctrl.signal);
+            } else throw e;
+          }
           const blocks = Array.isArray(data.content) ? data.content : [];
           rawText += blocks.filter((b) => b.type === "text").map((b) => b.text).join(" ");
           const uses = blocks.filter((b) => b.type === "tool_use");
@@ -131,13 +158,17 @@
           ]);
         }
         const reply = parseReply(rawText);
-        if (!reply.text) reply.text = "Hmm.";
+        if (!reply.text) reply.text = "Hmm, I lost my words there.";
+        this.last = { ok: true, ms: Date.now() - t0, at: Date.now(), text: "" };
         // Rolling memory keeps plain text only; images aren't re-sent.
         if (opts.noHistory) return { text: reply.text, mood: reply.mood, raw: rawText };
         this.history.push({ role: "user", content: (image ? "[showed you a camera picture] " : "") + (text || "What do you see?") });
         this.history.push({ role: "assistant", content: (reply.mood ? "[" + reply.mood + "] " : "") + reply.text });
         if (this.history.length > 40) this.history = this.history.slice(-40);
         return { text: reply.text, mood: reply.mood, raw: rawText };
+      } catch (e) {
+        this.last = { ok: false, ms: Date.now() - t0, at: Date.now(), text: (e.kind || "error") + (e.status ? " " + e.status : "") + ": " + (e.detail || e.message) };
+        throw e;
       } finally {
         clearTimeout(timer);
         this.busy = false;
@@ -147,5 +178,6 @@
 
   DB.Brain = Brain;
   DB.BrainError = BrainError;
+  DB.classifyBrainError = classify;
   DB.parseReply = parseReply;
 })();

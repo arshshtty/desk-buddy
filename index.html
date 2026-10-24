@@ -30,6 +30,7 @@
     <div class="dl muted" id="dEvent"></div>
     <div class="dl" id="dText"></div>
     <div class="dl muted" id="dCam"></div>
+    <div class="dl muted" id="dReply"></div>
   </div>
 
   <div id="captions">
@@ -102,6 +103,14 @@
         <label>Wake word
           <input id="sWake" autocomplete="off" spellcheck="false">
         </label>
+        <label>Require the wake word
+          <select id="sWakeMode">
+            <option value="on">Yes: only answer after the wake word (default)</option>
+            <option value="conversation">Conversation mode: answer everything while someone is on camera</option>
+            <option value="off">No: answer everything I hear</option>
+          </select>
+        </label>
+        <p class="muted small" id="wakeModeNote">Conversation mode only works with the camera on; with it off, the wake word is still needed. Either way, after each reply there's a follow-up window (below) when no wake word is needed. Without the wake word, Buddy also answers the TV and other people.</p>
         <label>Listening mode
           <select id="sListenMode">
             <option value="always">Always: wakes up when it hears a voice (default)</option>
@@ -179,7 +188,7 @@
         <label>…one glance every (minutes)
           <input id="sGlanceMin" type="number" min="2" max="240" step="1">
         </label>
-        <p class="muted small">Curious glances send one small photo (320 px) to Claude every few minutes while someone is in view, and Buddy comments on it. Each glance uses roughly 100 input tokens for the picture (Anthropic's rule of thumb is width × height ÷ 750), plus the personality prompt and a short reply of up to 120 tokens: about the cost of one short question. These are estimates; check usage in the Claude Console.</p>
+        <p class="muted small">Curious glances send one small photo (320 px) to Claude every few minutes while someone is in view, and Buddy comments on it. Each glance uses roughly 100 input tokens for the picture (Anthropic's rule of thumb is width × height ÷ 750), plus the personality prompt and a short reply capped at 300 output tokens (thinking counts towards that cap): about the cost of one short question. These are estimates; check usage in the Claude Console.</p>
         <label class="check"><input id="sPreview" type="checkbox"> Show a small camera preview</label>
       </fieldset>
 
