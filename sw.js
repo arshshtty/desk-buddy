@@ -1,9 +1,9 @@
 /* Desk Buddy service worker: caches the app shell so it opens offline and can be installed.
    API calls (api.anthropic.com) and anything off this origin are never cached. */
-const CACHE = "desk-buddy-v1";
+const CACHE = "desk-buddy-v3";
 const SHELL = [
   "./", "./index.html", "./styles.css", "./manifest.webmanifest",
-  "./js/store.js", "./js/eye.js", "./js/adapters.js", "./js/camera.js", "./js/brain.js", "./js/app.js",
+  "./js/store.js", "./js/eye.js", "./js/face-ball.js", "./js/adapters.js", "./js/vad.js", "./js/camera.js", "./js/brain.js", "./js/app.js",
   "./icons/icon.svg", "./icons/icon-192.png", "./icons/icon-512.png", "./icons/icon-maskable-512.png",
 ];
 self.addEventListener("install", (e) => {

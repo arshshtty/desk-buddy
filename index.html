@@ -92,17 +92,21 @@
         <label>Wake word
           <input id="sWake" autocomplete="off" spellcheck="false">
         </label>
-        <label class="check"><input id="sAlwaysListen" type="checkbox"> Listen all the time for the wake word</label>
+        <label>Listening mode
+          <select id="sListenMode">
+            <option value="always">Always: wakes up when it hears a voice (default)</option>
+            <option value="tap">Tap to talk only: no sounds unless you press 🎙️</option>
+            <option value="off">Off: microphone never used</option>
+          </select>
+        </label>
+        <p class="muted small" id="beepNote">On Android, Chrome plays a short sound each time speech recognition starts, and a web page can't turn that off. "Always" keeps it to one sound each time you start speaking (not a constant on/off loop). "Tap to talk only" makes no sound until you press 🎙️. The local Whisper speech server planned for later removes the sound entirely. Tip: put "Hey" before the wake word ("Hey Jarvis, …") so the phone has started listening by the time you say the name.</p>
+        <label>Buddy's name (shown in the captions)
+          <input id="sName" autocomplete="off" spellcheck="false" placeholder="Buddy">
+        </label>
         <label>Speech language
           <input id="sLang" autocomplete="off" spellcheck="false" placeholder="en-AU">
         </label>
-        <label>Stop talking when I…
-          <select id="sBarge">
-            <option value="wake">say the wake word or "stop", or tap (best on phones)</option>
-            <option value="any">say anything, or tap (use headphones, or it hears itself)</option>
-            <option value="tap">tap only</option>
-          </select>
-        </label>
+        <p class="muted small">While Buddy is talking (and for a moment after) the microphone is ignored, so it can't hear itself. To interrupt, tap the eye or press Esc.</p>
         <label>Follow-up window after a reply (seconds, no wake word needed)
           <input id="sFollow" type="number" min="0" max="30" step="1">
         </label>
@@ -156,6 +160,12 @@
 
       <fieldset>
         <legend>Screen</legend>
+        <label>Face
+          <select id="sFace">
+            <option value="ball">Round ball (new)</option>
+            <option value="eye">Classic eye</option>
+          </select>
+        </label>
         <label class="check"><input id="sWakeLock" type="checkbox"> Keep the screen on</label>
         <label>Get sleepy after (minutes idle)
           <input id="sSleepy" type="number" min="1" max="120" step="1">
@@ -186,7 +196,9 @@
 
   <script src="js/store.js"></script>
   <script src="js/eye.js"></script>
+  <script src="js/face-ball.js"></script>
   <script src="js/adapters.js"></script>
+  <script src="js/vad.js"></script>
   <script src="js/camera.js"></script>
   <script src="js/brain.js"></script>
   <script src="js/app.js"></script>

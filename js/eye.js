@@ -1,4 +1,9 @@
-/* Desk Buddy: the round animated eye, drawn on a <canvas>.
+/* Desk Buddy: the "Classic eye" face, drawn on a <canvas>. It also holds the behaviour shared by every
+   face (gaze, blinks, moods, sleep, yawns, speech level); js/face-ball.js extends it and only redraws.
+
+   Face interface used by app.js:
+     setMood(m, s) blink() lookAt(x, y, ms) setSpeaking(on) pulse() setListening(on) yawn() sleep() wake(surprise)
+     pet(x, y) isOnEye(x, y) destroy() adopt(otherFace)    state: mood asleep speaking level frames cx cy R
    Same look as the Round-Eye Face Tracker firmware (RoundEye.ino): navy skin, white eye, blue iris,
    blink every 1.5-6 s, idle wander, moods with lids. Geometry is in the firmware's 240 px units, scaled. */
 (function () {
@@ -47,8 +52,17 @@
       this.resize = this.resize.bind(this);
       window.addEventListener("resize", this.resize);
       this.resize();
-      const loop = (t) => { this.tick(t); requestAnimationFrame(loop); };
+      this.alive = true;
+      const loop = (t) => { if (!this.alive) return; this.tick(t); requestAnimationFrame(loop); };
       requestAnimationFrame(loop);
+    }
+    /** Stop drawing (used when switching faces). */
+    destroy() { this.alive = false; window.removeEventListener("resize", this.resize); }
+    /** Copy mood/sleep/gaze from another face so a switch looks continuous. */
+    adopt(o) {
+      if (!o) return;
+      this.mood = o.mood; this.moodUntil = o.moodUntil; this.asleep = o.asleep; this.open = o.open;
+      this.gx = this.tx = o.gx; this.gy = this.ty = o.gy; this.speaking = o.speaking; this.listening = o.listening;
     }
 
     resize() {

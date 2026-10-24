@@ -29,12 +29,21 @@ html, body {
 
 #captions {
   position: fixed; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 92px);
-  padding: 0 16px; text-align: center; pointer-events: none;
+  padding: 0 14px; pointer-events: none;
+  display: flex; flex-direction: column; gap: 6px; max-width: 46em; margin: 0 auto;
 }
-.line { min-height: 1.4em; max-width: 52em; margin: 2px auto; text-shadow: 0 1px 3px #000; }
-.heard { color: var(--muted); font-size: 15px; }
-.heard .interim { opacity: 0.6; }
-.said { color: var(--fg); font-size: 18px; }
+/* Two clearly different speakers: you on the right in blue, Buddy on the left in white/yellow. */
+.line { max-width: 85%; padding: 6px 12px; border-radius: 14px; text-shadow: none; }
+.line:empty { display: none; }
+.line .who { font-weight: 700; margin-right: 6px; }
+.heard { align-self: flex-end; text-align: right; color: #d6e6ff; background: rgba(30, 110, 220, 0.35);
+         border: 1px solid rgba(90, 150, 240, 0.55); border-bottom-right-radius: 4px; font-size: 15px; }
+.heard .who { color: #8fc0ff; }
+.heard.interim { opacity: 0.6; font-style: italic; }
+.said { align-self: flex-start; text-align: left; color: var(--fg); background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.18); border-bottom-left-radius: 4px; font-size: 18px; }
+.said .who { color: #ffcc00; }
+.said.aside { font-style: italic; opacity: 0.85; font-size: 15px; }
 
 #preview {
   position: fixed; top: calc(env(safe-area-inset-top) + 40px); right: 12px; width: 96px; height: 72px;

@@ -5,9 +5,10 @@
    STT interface                         TTS interface
      .supported   boolean                  .supported   boolean
      .running     boolean                  .speaking    boolean
-     .start()                              .voices()    -> [{id, name, lang, isDefault}]
-     .stop()                               .speak(text, {voice, rate, pitch, lang}) -> Promise (resolves when done or cancelled)
+     .start({track}) one session          .voices()    -> [{id, name, lang, isDefault}]
+     .stop() .abort()                      .speak(text, {voice, rate, pitch, lang}) -> Promise (resolves when done or cancelled)
      .setLang(lang)                        .cancel()
+     onEnd(gotResult)
      onResult(text, isFinal)               onStart(), onWord(), onEnd(), onVoices()
      onSpeech()   any sign of speech
      onState(state, detail)  "listening" | "idle" | "error"
@@ -17,55 +18,67 @@
   const DB = (window.DB = window.DB || {});
   const noop = () => {};
 
-  /* ---------------- Browser speech recognition (Web Speech API) ---------------- */
+  /* ---------------- Browser speech recognition (Web Speech API) ----------------
+     One session per utterance: start() is called when the voice detector hears speech (or on a
+     tap), the session ends by itself after the utterance, and nothing restarts it. There is no
+     restart loop or watchdog any more: on Android every start plays a system sound, so the
+     number of starts is kept as low as possible. */
   class BrowserSTT {
     constructor(opts) {
       this.Impl = window.SpeechRecognition || window.webkitSpeechRecognition || null;
       this.supported = !!this.Impl;
       this.lang = (opts && opts.lang) || "en-AU";
-      this.wanted = false; this.running = false;
-      this.rec = null; this.backoff = 250; this.lastStart = 0; this.fatal = false;
-      this.onResult = noop; this.onSpeech = noop; this.onState = noop;
-      // Chrome (Android especially) ends recognition every few seconds even with continuous = true,
-      // and sometimes ends without firing onend. A watchdog restarts it.
-      this.watchdog = setInterval(() => {
-        if (this.wanted && !this.running && Date.now() - this.lastStart > 4000) this._start();
-      }, 2000);
+      this.running = false; this.rec = null; this.fatal = false;
+      this.starts = 0; this.lastStart = 0; this.gotResult = false; this.maxTimer = 0; this.source = "";
+      this.onResult = noop; this.onSpeech = noop; this.onState = noop; this.onEnd = noop;
     }
     setLang(l) { this.lang = l || this.lang; if (this.rec) this.rec.lang = this.lang; }
-    start() {
-      if (!this.supported) { this.onState("error", "Speech recognition isn't available in this browser"); return; }
-      this.wanted = true; this.fatal = false; this.backoff = 250;
-      this._start();
+    /** Start one recognition session. opts.track: optional audio MediaStreamTrack (Chrome 135+ desktop)
+        so recognition can hear a slightly delayed copy of the mic, which keeps the first syllable. */
+    start(opts) {
+      opts = opts || {};
+      if (!this.supported) { this.onState("error", "Speech recognition isn't available in this browser"); return false; }
+      if (this.fatal || this.running) return false;
+      const r = this._make();
+      this.rec = r; this.gotResult = false; this.source = opts.source || "";
+      this.lastStart = Date.now(); this.starts++;
+      this.running = true;                       // set now so nothing else starts a second session
+      let ok = false;
+      if (opts.track && opts.track.readyState === "live") { try { r.start(opts.track); ok = true; } catch (e) { /* not supported: use the mic */ } }
+      if (!ok) { try { r.start(); ok = true; } catch (e) { ok = false; } }
+      if (!ok) { this.running = false; this.rec = null; return false; }
+      clearTimeout(this.maxTimer);
+      this.maxTimer = setTimeout(() => this.stop(), opts.maxMs || 15000);   // never leave it open long
+      return true;
     }
-    stop() {
-      this.wanted = false;
-      if (this.rec) { try { this.rec.abort(); } catch (e) { /* already stopped */ } }
-    }
+    /** Stop listening but return what was heard. */
+    stop() { if (this.rec && this.running) { try { this.rec.stop(); } catch (e) { /* already stopped */ } } }
+    /** Stop now and throw away anything heard (used when Buddy starts talking). */
+    abort() { if (this.rec && this.running) { try { this.rec.abort(); } catch (e) { /* already stopped */ } } }
     _make() {
       const r = new this.Impl();
-      r.continuous = true;
+      r.continuous = false;                      // end by itself after one utterance
       r.interimResults = true;
       r.maxAlternatives = 1;
       r.lang = this.lang;
-      r.onstart = () => { this.running = true; this.onState("listening"); };
+      r.onstart = () => { this.onState("listening"); };
       r.onspeechstart = () => this.onSpeech();
       r.onresult = (ev) => {
+        if (r !== this.rec) return;
         let interim = "", final = "";
         for (let i = ev.resultIndex; i < ev.results.length; i++) {
           const res = ev.results[i];
           if (res.isFinal) final += res[0].transcript; else interim += res[0].transcript;
         }
-        this.backoff = 250;
         this.onSpeech();
-        if (final.trim()) this.onResult(final.trim(), true);
+        if (final.trim()) { this.gotResult = true; this.onResult(final.trim(), true); }
         else if (interim.trim()) this.onResult(interim.trim(), false);
       };
       r.onerror = (ev) => {
         const e = ev.error;
-        if (e === "no-speech" || e === "aborted") return;           // normal; onend restarts
+        if (e === "no-speech" || e === "aborted") return;           // normal
         if (e === "not-allowed" || e === "service-not-allowed") {
-          this.fatal = true; this.wanted = false;
+          this.fatal = true;
           this.onState("error", "Microphone permission was refused");
           return;
         }
@@ -73,24 +86,15 @@
         else if (e === "network") this.onState("error", "Speech service unreachable (needs internet)");
         else if (e === "language-not-supported") this.onState("error", "Speech language not supported: " + this.lang);
         else this.onState("error", "Speech error: " + e);
-        this.backoff = Math.min(10000, this.backoff * 3);
       };
       r.onend = () => {
-        this.running = false;
-        if (this.wanted && !this.fatal) setTimeout(() => this._start(), this.backoff);
-        else this.onState("idle");
+        if (r !== this.rec) return;
+        clearTimeout(this.maxTimer);
+        this.running = false; this.rec = null;
+        this.onState("idle");
+        this.onEnd(this.gotResult);              // no restart: the next voice onset starts a new session
       };
       return r;
-    }
-    _start() {
-      if (!this.wanted || this.running) return;
-      if (!this.rec) this.rec = this._make();
-      this.lastStart = Date.now();
-      try { this.rec.start(); }
-      catch (e) {
-        // InvalidStateError: it's already running. Anything else: rebuild it next time.
-        if (!(e && e.name === "InvalidStateError")) this.rec = null;
-      }
     }
   }
 
@@ -173,10 +177,11 @@
        TTS: POST {"text": "...", "voice": "af_heart"} to {url}/tts -> audio/wav, played via an <audio> element
      The settings page shows the URL field disabled until this exists. */
   class LocalServerSTT {
-    constructor() { this.supported = false; this.running = false; this.onResult = noop; this.onSpeech = noop; this.onState = noop; }
+    constructor() { this.supported = false; this.running = false; this.starts = 0; this.onResult = noop; this.onSpeech = noop; this.onState = noop; this.onEnd = noop; }
     setLang() {}
-    start() { this.onState("error", "The local speech server isn't built yet"); }
+    start() { this.onState("error", "The local speech server isn't built yet"); return false; }
     stop() {}
+    abort() {}
   }
   class LocalServerTTS {
     constructor() { this.supported = false; this.speaking = false; this.onStart = noop; this.onWord = noop; this.onEnd = noop; this.onVoices = noop; }

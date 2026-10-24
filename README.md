@@ -25,8 +25,33 @@ A plain `http://192.168.x.x:8000` address from another device is **not** secure,
    For a few seconds after each reply you can follow up without the wake word.
    - "Jarvis, take a note: buy milk" · "Jarvis, read my notes" (📝 to view, delete, or export as .md)
    - "Jarvis, what is this?" / "look at this" / press 👁️: sends one camera frame to Claude
-   - "Jarvis, go to sleep" · "Jarvis, start over" (forget the conversation) · "stop" while it's talking
-4. Tap the eye to poke it, stroke it to pet it, and tap while it's talking to stop it.
+   - "Jarvis, go to sleep" · "Jarvis, start over" (forget the conversation)
+4. Tap the eye to poke it, stroke it to pet it, and tap it (or press Esc) while it's talking to stop it.
+
+Captions show **You:** (right, blue) for what it heard from you and **Buddy:** (left; the name is a setting) for its replies.
+
+## Faces
+
+Settings → Screen → **Face**: **Round ball** (new, default) or **Classic eye** (the RoundEye firmware look).
+Both share the same face interface (moods, gaze, blinks, yawns, sleep with drifting z's, petting, listening ring,
+thinking indicator), so the rest of the app doesn't care which is shown. Canvas 2D at about 30 fps, devicePixelRatio capped at 2.
+
+![Round ball face](screenshot-ball.png)
+
+## Listening
+
+Settings → **Listening mode**:
+
+- **Always** (default): one microphone stream stays open the whole time and a small voice-activity detector
+  (`js/vad.js`: loudness vs. an adaptive background-noise level, 250 ms minimum, 700 ms hangover) watches it.
+  Speech recognition starts only when it hears a voice, at most once every 2 s, and ends by itself after you
+  stop talking. Nothing restarts it in a loop.
+- **Tap to talk only**: recognition starts only when you press 🎙️ / Space. No sounds otherwise.
+- **Off**: the microphone is never used.
+
+While Buddy is speaking, and for 800 ms after, the mic is ignored and any running recognition is aborted.
+Any transcript where more than half of the words match Buddy's last two replies is dropped as an echo.
+To interrupt Buddy, tap the eye or press Esc.
 
 The eye blinks, wanders, glances around, yawns after a while, gets sleepy after the idle time set in settings,
 and falls asleep after twice that. It wakes when it hears speech, sees motion (with the camera on), or is tapped.
@@ -38,11 +63,13 @@ Moods are neutral, happy, curious, surprised, thinking, sleepy and angry. Claude
 | --- | --- |
 | `index.html`, `styles.css` | Page, controls, settings and notes dialogs |
 | `js/store.js` | Settings, API key and notes in localStorage. Default personality |
+| `js/face-ball.js` | **Round ball** face (default): an original glowing planet character with two big glossy eyes, brows, blush and a stretchy talking mouth. Extends the eye's behaviour, only redraws |
 | `js/eye.js` | Canvas eye: same colours and geometry as the RoundEye firmware. Moods, blink, wander, yawn, sleep, mouth |
-| `js/adapters.js` | **STT/TTS adapter interface**: browser engines now, `LocalServerSTT` / `LocalServerTTS` stubs for later |
+| `js/adapters.js` | **STT/TTS adapter interface**: browser engines now (one recognition session per utterance), `LocalServerSTT` / `LocalServerTTS` stubs for later |
+| `js/vad.js` | Voice-activity detector on a single always-open mic stream; gates when recognition starts |
 | `js/camera.js` | getUserMedia, front/back, JPEG grab, 40×30 frame-diff motion detection |
 | `js/brain.js` | Anthropic Messages API from the browser, rolling memory, `save_note` / `list_notes` tools |
-| `js/app.js` | Wake word, push-to-talk, intents, barge-in, idle behaviour, wake lock, fullscreen |
+| `js/app.js` | Listening modes, mute while speaking, echo filter, wake word, push-to-talk, intents, idle behaviour, wake lock, fullscreen |
 | `manifest.webmanifest`, `sw.js`, `icons/` | Installable PWA. The service worker caches only the app's own files, never API calls |
 
 ## Model
@@ -58,10 +85,15 @@ and `POST {url}/tts` with `{text, voice}` → `audio/wav` (Kokoro). The settings
 
 ## Known limitations
 
-- **Chrome speech recognition sends audio to Google's servers** and needs internet. On Android it stops every few
-  seconds even in continuous mode. The app restarts it, but some phones play a beep on each restart.
-- The phone's mic hears the phone's own voice. By default only the wake word, "stop", or a tap interrupts speech.
-  Choose "say anything" only with headphones.
+- **Chrome speech recognition sends audio to Google's servers** and needs internet.
+- **Android plays a sound every time Chrome starts speech recognition**, and a web page can't turn that off. In
+  "Always" mode that's one sound each time you start talking (and also for other voices or a TV nearby). "Tap to talk only"
+  avoids it except when you tap. The planned local Whisper server removes it entirely.
+- Recognition can't be handed audio from before it started, so on Android the first syllable can be lost. The wake
+  word is matched loosely at the start of a sentence ("arvis" counts as "Jarvis"), and saying "Hey Jarvis" helps.
+  Desktop Chrome 135+ is given a 0.5 s delayed copy of the mic instead, so nothing is lost there.
+- Because the mic is ignored while Buddy talks, you can't interrupt it by voice. Tap the eye instead.
+- Echo cancellation in the browser is imperfect, which is why the mute and echo filter exist.
 - iOS/Safari isn't tested. Speech recognition there depends on Siri/Dictation, continuous listening is unreliable,
   there's no Fullscreen API on iPhone, and the wake lock needs a recent iOS.
 - Chrome may pause the mic and camera when the screen turns off or the tab is in the background. Keep the app in front with the wake lock on.

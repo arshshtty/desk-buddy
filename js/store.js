@@ -20,10 +20,11 @@
     effort: "low",
     system: DEFAULT_SYSTEM,
     memory: 6,
+    face: "ball",            // "ball" (Round ball) or "eye" (Classic eye)
+    name: "Buddy",           // shown in the captions as "Buddy: ..."
     wakeWord: "Jarvis",
-    alwaysListen: true,
+    listenMode: "always",    // "always" (voice-activated), "tap" (tap to talk only), "off"
     lang: navigator.language || "en-AU",
-    barge: "wake",
     followUp: 8,
     voiceURI: "",
     rate: 1.05,
@@ -47,7 +48,13 @@
     DEFAULT_SYSTEM,
     loadSettings() {
       const saved = safeParse(localStorage.getItem(K_SETTINGS), {});
-      return Object.assign({}, DEFAULTS, saved);
+      // v1 had a checkbox "alwaysListen" instead of listenMode.
+      if (saved.listenMode == null && saved.alwaysListen === false) saved.listenMode = "tap";
+      delete saved.alwaysListen; delete saved.barge;
+      const s = Object.assign({}, DEFAULTS, saved);
+      if (!["always", "tap", "off"].includes(s.listenMode)) s.listenMode = "always";
+      if (s.face !== "eye") s.face = "ball";
+      return s;
     },
     saveSettings(s) {
       const copy = {};

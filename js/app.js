@@ -1,16 +1,31 @@
-/* Desk Buddy: wiring. Wake word -> command -> local intent or Claude -> speech, with the eye reacting throughout. */
+/* Desk Buddy: wiring. Voice detected -> one recognition session -> wake word -> command -> local intent or Claude
+   -> speech, with the eye reacting throughout. While Buddy talks (and for 800 ms after) the mic is ignored,
+   and anything that sounds like Buddy's own recent words is dropped, so it never answers itself. */
 (function () {
   "use strict";
   const DB = window.DB;
   const $ = (id) => document.getElementById(id);
 
   let settings = DB.store.loadSettings();
-  const eye = new DB.Eye($("eye"));
+  let eye = DB.makeFace(settings.face, $("eye"));   // "ball" (default) or "eye": same interface either way
+  function setFace(kind) {
+    const old = eye;
+    if ((kind === "eye") === !(old instanceof DB.BallFace)) return;
+    old.destroy();
+    eye = DB.makeFace(kind, $("eye"));
+    eye.adopt(old);
+  }
   const cam = new DB.Camera($("preview"));
   let stt = DB.makeSTT(settings.sttEngine, { lang: settings.lang });
   let tts = DB.makeTTS(settings.ttsEngine);
   const notesApi = { add: (t) => DB.store.addNote(t), list: () => DB.store.notes() };
   const brain = new DB.Brain(() => settings, () => DB.store.getKey(), notesApi);
+  const vad = new DB.VoiceDetector();
+
+  const COOLDOWN_MS = 2000;     // recognition starts at most once every 2 s (each start beeps on Android)
+  const TAIL_MS = 800;          // keep ignoring the mic this long after Buddy stops talking
+  const BARGE_TAIL_MS = 300;    // shorter when the speech was cut off by a tap
+  const ECHO_WINDOW_MS = 120000;
 
   const st = {
     started: false,
@@ -24,33 +39,49 @@
     lastGlance: 0,
     wakeLock: null,
     error: "",
+    muteUntil: 0,           // the mic is ignored until then (Buddy talking + tail)
+    lastSttStart: 0,
+    pendingStart: 0,
+    sessionSource: "",      // what started the current recognition session: "voice" | "tap"
+    recentSaid: [],         // last two things Buddy said, for the echo filter
+    drops: { echo: 0, muted: 0, ignored: 0 },
+    releaseMic: false,      // fallback if a phone won't let recognition share the mic with the detector
   };
 
   /* ---------------- small helpers ---------------- */
   function setStatus(text, dot) {
     $("statusText").textContent = text;
     const d = $("micDot");
-    d.className = "dot " + (dot || (stt.running ? "on" : "off"));
+    d.className = "dot " + (dot || (stt.running || vad.running ? "on" : "off"));
   }
   function idleStatus() {
     if (!st.started) return setStatus("Tap to start", "off");
     if (st.error) return setStatus(st.error, "err");
     if (tts.speaking) return setStatus("Speaking… tap the eye to stop", "on");
     if (brain.busy) return setStatus("Thinking…", "on");
-    if (listeningForCommand()) return setStatus("Listening…", "wake");
-    if (stt.running) return setStatus('Say "' + settings.wakeWord + '…" or press 🎙️', "on");
-    return setStatus(settings.alwaysListen ? "Mic starting…" : "Press 🎙️ to talk", "off");
+    if (stt.running) return setStatus(listeningForCommand() ? "Listening…" : "Hearing you…", "wake");
+    if (listeningForCommand()) return setStatus(settings.listenMode === "always" ? "Listening… just talk" : "Press 🎙️ to talk", "wake");
+    if (settings.listenMode === "off") return setStatus("Microphone off (settings)", "off");
+    if (settings.listenMode === "tap") return setStatus("Press 🎙️ to talk", "off");
+    if (vad.running) return setStatus('Say "' + settings.wakeWord + '…" or press 🎙️', "on");
+    return setStatus("Mic starting…", "off");
   }
   function listeningForCommand() {
     const now = Date.now();
     return now < st.awaitUntil || now < st.followUntil || now < st.pttUntil;
   }
-  function showHeard(final, interim) {
-    const el = $("heard");
-    el.textContent = final || "";
-    if (interim) { const s = document.createElement("span"); s.className = "interim"; s.textContent = (final ? " " : "") + interim; el.appendChild(s); }
+  /* Captions: "You: …" (right, blue) only for real things you said; "<name>: …" (left) for Buddy. */
+  function captionLine(el, base, who, text, extra) {
+    el.textContent = "";
+    el.className = "line " + base + (extra ? " " + extra : "");
+    if (!text) return;
+    const w = document.createElement("span"); w.className = "who"; w.textContent = who + ":";
+    const t = document.createElement("span"); t.className = "txt"; t.textContent = text;
+    el.append(w, t);
   }
-  function showSaid(text) { $("said").textContent = text || ""; }
+  // interim: true = faint (still hearing you, or not for Buddy); "partial" = recognition still in progress
+  function showHeard(text, interim) { captionLine($("heard"), "heard", "You", text, interim ? "interim" + (interim === "partial" ? " partial" : "") : ""); }
+  function showSaid(text, aside) { captionLine($("said"), "said", (settings.name || "Buddy").trim() || "Buddy", text, aside ? "aside" : ""); }
 
   function tokens(s) {
     return String(s).toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, " ").split(/\s+/).filter(Boolean);
@@ -63,15 +94,47 @@
     return d[m][n];
   }
   const near = (heard, want) => heard === want || (want.length >= 5 && lev(heard, want) <= 1);
+  // Recognition starts a moment after you start speaking (on Android it can't be given the audio from
+  // before it started), so the first syllable of the wake word can be lost: "Jarvis" -> "arvis"/"service",
+  // "Buddy" -> "daddy". At the start of an utterance we accept a clipped or slightly wrong wake word.
+  const nearLoose = (heard, want) => near(heard, want) ||
+    (want.length >= 4 && lev(heard, want) <= 2) ||
+    (heard.length >= 3 && want.length - heard.length <= 3 && want.endsWith(heard)) ||
+    (want.length >= 5 && heard.length >= 3 && lev(heard, want.slice(Math.max(1, want.length - heard.length))) <= 1);
   /** Returns the words after the wake word, "" if it was said alone, or null if it wasn't said. */
   function afterWake(text) {
     const wt = tokens(settings.wakeWord), tt = tokens(text);
     if (!wt.length) return null;
     for (let i = 0; i + wt.length <= tt.length; i++) {
-      if (wt.every((w, j) => near(tt[i + j], w))) return tt.slice(i + wt.length).join(" ");
+      // loose matching only for the first word, or the second after "hey"/"ok"/"hi"
+      const loose = i === 0 || (i === 1 && /^(hey|hi|ok|okay|oi|yo)$/.test(tt[0]));
+      if (wt.every((w, j) => (loose && j === 0 ? nearLoose : near)(tt[i + j], w))) return tt.slice(i + wt.length).join(" ");
     }
     return null;
   }
+
+  /* Echo filter: a transcript made mostly of words Buddy just said is Buddy hearing itself. */
+  const STOPWORDS = new Set(("a an the and or but so to of in on at for with from by as is it it's its i i'm you you're me my " +
+    "your we he she they them this that there here be am are was were do does did have has had what what's how who " +
+    "not no yes oh um uh like just").split(" "));
+  function contentTokens(s) {
+    const wake = new Set(tokens(settings.wakeWord));
+    return tokens(s).filter((w) => !STOPWORDS.has(w) && !wake.has(w));
+  }
+  function rememberSaid(text) {
+    st.recentSaid.push({ text: String(text), at: Date.now() });
+    if (st.recentSaid.length > 2) st.recentSaid.shift();
+  }
+  function echoScore(text) {
+    const t = contentTokens(text);
+    if (t.length < 3) return 0;                     // too short to judge
+    const now = Date.now();
+    const said = new Set(st.recentSaid.filter((r) => now - r.at < ECHO_WINDOW_MS).flatMap((r) => contentTokens(r.text)));
+    if (!said.size) return 0;
+    return t.filter((w) => said.has(w)).length / t.length;
+  }
+  const isEcho = (text) => echoScore(text) > 0.5;
+  const muted = () => tts.speaking || Date.now() < st.muteUntil;
   const STOP_RE = /^(stop|stop it|stop talking|be quiet|quiet|shut up|enough|never mind|nevermind|cancel|ok stop|okay stop)\b/i;
 
   function activity(kind) {
@@ -81,55 +144,106 @@
   }
 
   /* ---------------- speech in ---------------- */
+  // Only start recognition when it's needed: a voice onset in "always" mode, or a tap. At most once per COOLDOWN_MS.
+  function startRecognition(source) {
+    if (!st.started || settings.listenMode === "off" || stt.running || muted() || !stt.supported) return false;
+    if (source === "voice" && settings.listenMode !== "always") return false;
+    const wait = COOLDOWN_MS - (Date.now() - st.lastSttStart);
+    if (wait > 0) {
+      // Too soon: try again when the cooldown ends if you're still talking (or you tapped).
+      clearTimeout(st.pendingStart);
+      st.pendingStart = setTimeout(() => {
+        st.pendingStart = 0;
+        if (source === "tap" ? Date.now() < st.pttUntil : vad.inSpeech) startRecognition(source);
+      }, wait + 10);
+      return false;
+    }
+    if (st.releaseMic && vad.running) vad.stop();
+    st.lastSttStart = Date.now();
+    st.sessionSource = source;
+    const ok = stt.start({ track: st.releaseMic ? null : vad.track, source });
+    idleStatus();
+    return ok;
+  }
+  async function ensureMic() {
+    if (!st.started || settings.listenMode !== "always" || vad.running || stt.running) return;
+    try { await vad.start(); if (/^Microphone/.test(st.error)) st.error = ""; }
+    catch (e) {
+      st.error = "Microphone: " + (e && e.name === "NotAllowedError" ? "permission was refused" : (e && (e.message || e.name)) || "unavailable");
+    }
+    idleStatus();
+  }
+  function updateMute() {
+    vad.setMuted(muted());
+    if (!muted() && st.mutePending) { st.mutePending = false; idleStatus(); }
+  }
+
   function wireSTT() {
-    stt.onSpeech = () => activity("speech");
+    stt.onSpeech = () => { if (!muted()) activity("speech"); };
     stt.onState = (state, detail) => {
-      st.error = state === "error" ? detail || "Microphone error" : "";
+      if (state === "error") {
+        // Some phones may not let recognition use the mic while the detector holds it open.
+        if (/No microphone/.test(detail || "") && vad.running && !st.releaseMic) { st.releaseMic = true; return; }
+        st.error = detail || "Microphone error";
+      } else if (state === "listening") st.error = "";
+      idleStatus();
+    };
+    stt.onEnd = () => {
+      // No restart here. The next voice onset (or tap) starts the next session.
+      if (st.releaseMic) ensureMic();
+      const h = $("heard");
+      if (h.classList.contains("partial")) showHeard("");
       idleStatus();
     };
     stt.onResult = (text, isFinal) => {
-      if (!isFinal) {
-        showHeard("", text);
-        if (tts.speaking) {
-          if (settings.barge === "any" && text.length > 3) stopSpeaking();
-          else if (settings.barge === "wake" && (afterWake(text) !== null || STOP_RE.test(text.trim()))) stopSpeaking();
-        }
-        return;
-      }
-      showHeard(text, "");
+      if (muted()) { if (isFinal) st.drops.muted++; return; }
+      if (!isFinal) { if (!isEcho(text)) showHeard(text, "partial"); return; }
       handleFinal(text);
+    };
+    vad.onVoiceStart = () => {
+      if (muted()) return;
+      if (eye.asleep || eye.mood === "sleepy") activity("voice"); else st.lastActivity = Date.now();
+      startRecognition("voice");
     };
   }
 
+  /** Handle one final transcript. Returns what happened, for the tests:
+      "muted" | "echo" | "ignored" | "wake" | "stop" | "command" | "empty". */
   function handleFinal(text) {
-    activity("speech");
+    text = String(text || "").trim();
+    if (!text) return "empty";
+    if (muted()) { st.drops.muted++; return "muted"; }
+    if (isEcho(text)) { st.drops.echo++; showHeard(""); return "echo"; }
     const wakeRest = afterWake(text);
-    if (tts.speaking) {
-      if (settings.barge === "tap") return;
-      if (settings.barge === "wake" && wakeRest === null && !STOP_RE.test(text.trim())) return;  // probably hearing itself
-      stopSpeaking();
-    }
     if (STOP_RE.test((wakeRest == null ? text : wakeRest).trim()) && (wakeRest !== null || listeningForCommand())) {
+      showHeard(text);
       st.awaitUntil = st.followUntil = st.pttUntil = 0;
       eye.setListening(false); idleStatus();
-      return;
+      return "stop";
     }
     const now = Date.now();
     let cmd = null;
     if (wakeRest !== null) {
+      activity("speech");
+      showHeard(text);
       if (wakeRest) cmd = wakeRest;
       else {
         st.awaitUntil = now + 8000;
         eye.setMood("curious", 8); eye.setListening(true); idleStatus();
         setTimeout(() => { if (Date.now() >= st.awaitUntil) { eye.setListening(listeningForCommand()); idleStatus(); } }, 8100);
-        return;
+        return "wake";
       }
-    } else if (listeningForCommand()) cmd = text;
-    if (cmd == null) return;
+    } else if (listeningForCommand()) { activity("speech"); showHeard(text); cmd = text; }
+    if (cmd == null) {                      // not for Buddy (no wake word): show it faintly, do nothing
+      st.drops.ignored++;
+      showHeard(text, true);
+      return "ignored";
+    }
     st.awaitUntil = st.pttUntil = st.followUntil = 0;
     eye.setListening(false);
-    if (!settings.alwaysListen) stt.stop();
+    $("btnTalk").classList.remove("active");
     runCommand(cmd);
+    return "command";
   }
 
   /* ---------------- commands ---------------- */
@@ -209,13 +323,22 @@
   /* ---------------- speech out ---------------- */
   function wireTTS() {
     tts.onStart = () => {
+      // Hard mute: Buddy must never hear itself. Kill any running recognition and ignore the mic.
+      st.muteUntil = Infinity;
+      clearTimeout(st.pendingStart); st.pendingStart = 0;
+      vad.setMuted(true);
+      if (stt.running) stt.abort();
+      if ($("heard").classList.contains("partial")) showHeard("");
       eye.setSpeaking(true); idleStatus();
-      if (settings.barge === "tap" && stt.running) stt.stop();
     };
     tts.onWord = () => eye.pulse();
     tts.onEnd = () => {
       eye.setSpeaking(false);
-      if (settings.barge === "tap" && settings.alwaysListen && st.started) stt.start();
+      const tail = st.bargeAt && Date.now() - st.bargeAt < 200 ? BARGE_TAIL_MS : TAIL_MS;
+      st.bargeAt = 0;
+      st.muteUntil = Date.now() + tail;
+      st.mutePending = true;
+      setTimeout(updateMute, tail + 10);
       idleStatus();
     };
     tts.onVoices = () => fillVoices();
@@ -223,22 +346,19 @@
   async function say(text, noFollow) {
     showSaid(text);
     if (!tts.supported) return;
+    rememberSaid(text);
     await tts.speak(text, { voice: settings.voiceURI, rate: +settings.rate, pitch: +settings.pitch, lang: settings.lang });
-    if (!noFollow && settings.followUp > 0 && st.started) {
-      st.followUntil = Date.now() + settings.followUp * 1000;
-      if (!stt.running && !settings.alwaysListen) stt.start();
+    if (!noFollow && settings.followUp > 0 && st.started && settings.listenMode === "always") {
+      const ms = TAIL_MS + settings.followUp * 1000;
+      st.followUntil = Date.now() + ms;
       eye.setListening(true); idleStatus();
       setTimeout(() => {
-        if (!listeningForCommand()) {
-          eye.setListening(false);
-          if (!settings.alwaysListen && !brain.busy && !tts.speaking) stt.stop();
-          idleStatus();
-        }
-      }, settings.followUp * 1000 + 100);
+        if (!listeningForCommand()) { eye.setListening(false); idleStatus(); }
+      }, ms + 100);
     }
   }
   function stopSpeaking() {
-    if (tts.speaking) { tts.cancel(); eye.setSpeaking(false); eye.setMood("surprised", 0.8); }
+    if (tts.speaking) { st.bargeAt = Date.now(); tts.cancel(); eye.setSpeaking(false); eye.setMood("surprised", 0.8); }
   }
 
   /* ---------------- touch: pet, poke, barge-in ---------------- */
@@ -247,7 +367,7 @@
     down = { x: e.clientX, y: e.clientY, dist: 0, t: Date.now(), petted: false };
     activity("tap");
     if (tts.speaking) { stopSpeaking(); down.barge = true; return; }
-    if (eye.isOnEye(e.clientX, e.clientY)) eye.pet(e.clientX, e.clientY);
+    if (eye.isOnEye(e.clientX, e.clientY)) { if (eye.poke) eye.poke(); eye.pet(e.clientX, e.clientY); }
     else { eye.lookAt((e.clientX - eye.cx) / eye.R, (e.clientY - eye.cy) / eye.R, 1500); eye.setMood("curious", 2); }
   });
   $("eye").addEventListener("pointermove", (e) => {
@@ -258,7 +378,7 @@
     if (!down.petted && down.dist > eye.R * 0.8) {        // a stroke, not a tap
       down.petted = true;
       eye.pet(e.clientX, e.clientY);
-      showSaid(["Mmm, that's nice.", "Hehe.", "Purrr…", "More, please."][Math.floor(Math.random() * 4)]);
+      showSaid(["Mmm, that's nice.", "Hehe.", "Purrr…", "More, please."][Math.floor(Math.random() * 4)] + " (you're petting me)", true);
     }
   });
   const up = () => { down = null; };
@@ -269,19 +389,19 @@
   function pushToTalk() {
     if (!st.started) return start();
     activity("tap");
+    if (settings.listenMode === "off") { showSaid("My microphone is off. Turn listening on in settings.", true); return; }
+    const wasSpeaking = tts.speaking;
     stopSpeaking();
     st.pttUntil = Date.now() + 8000;
     eye.setMood("curious", 8); eye.setListening(true);
-    if (!stt.running) stt.start();
     $("btnTalk").classList.add("active");
     idleStatus();
+    // after a tap barge-in, wait out the short mute tail first
+    setTimeout(() => startRecognition("tap"), wasSpeaking ? BARGE_TAIL_MS + 30 : 0);
     setTimeout(() => {
       if (Date.now() >= st.pttUntil) {
         $("btnTalk").classList.remove("active");
-        if (!listeningForCommand()) {
-          eye.setListening(false);
-          if (!settings.alwaysListen && !brain.busy && !tts.speaking) stt.stop();
-        }
+        if (!listeningForCommand()) eye.setListening(false);
         idleStatus();
       }
     }, 8100);
@@ -331,7 +451,8 @@
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && st.started) {
       requestWakeLock();
-      if (settings.alwaysListen) stt.start();
+      if (vad.running && vad.stream && vad.stream.getAudioTracks().some((t) => t.readyState !== "live")) vad.stop();
+      ensureMic();                                  // reopens the detector's stream if the phone closed it; never starts recognition
     }
   });
   async function toggleFullscreen() {
@@ -379,13 +500,13 @@
     const s = settings;
     $("sKey").value = "";
     $("sModel").value = s.model; $("sEffort").value = s.effort; $("sSystem").value = s.system; $("sMemory").value = s.memory;
-    $("sWake").value = s.wakeWord; $("sAlwaysListen").checked = s.alwaysListen; $("sLang").value = s.lang;
-    $("sBarge").value = s.barge; $("sFollow").value = s.followUp;
+    $("sWake").value = s.wakeWord; $("sListenMode").value = s.listenMode; $("sLang").value = s.lang;
+    $("sName").value = s.name; $("sFollow").value = s.followUp;
     fillVoices();
     $("sRate").value = s.rate; $("sPitch").value = s.pitch; $("oRate").textContent = (+s.rate).toFixed(2); $("oPitch").textContent = (+s.pitch).toFixed(2);
     $("sCamera").value = s.camera; $("sMotion").checked = s.motion; $("sPreview").checked = s.preview;
     $("sSttEngine").value = s.sttEngine; $("sTtsEngine").value = s.ttsEngine; $("sLocalUrl").value = s.localUrl;
-    $("sWakeLock").checked = s.wakeLock; $("sSleepy").value = s.sleepyMinutes;
+    $("sWakeLock").checked = s.wakeLock; $("sSleepy").value = s.sleepyMinutes; $("sFace").value = s.face;
     keyState();
     $("settingsDlg").showModal();
     $("settingsForm").scrollTop = 0;
@@ -395,6 +516,7 @@
   $("btnClearKey").addEventListener("click", () => { DB.store.clearKey(); $("sKey").value = ""; keyState(); });
   $("btnResetSystem").addEventListener("click", () => { $("sSystem").value = DB.store.DEFAULT_SYSTEM; });
   $("btnTestVoice").addEventListener("click", () => {
+    rememberSaid("Hi, I'm your desk buddy.");
     tts.speak("Hi, I'm your desk buddy.", { voice: $("sVoice").value, rate: +$("sRate").value, pitch: +$("sPitch").value, lang: $("sLang").value });
   });
   $("settingsDlg").addEventListener("close", () => {
@@ -407,15 +529,16 @@
       system: $("sSystem").value.trim() || DB.store.DEFAULT_SYSTEM,
       memory: Math.max(0, Math.min(20, Math.round(num("sMemory", 6)))),
       wakeWord: $("sWake").value.trim() || DB.store.DEFAULTS.wakeWord,
-      alwaysListen: $("sAlwaysListen").checked,
+      listenMode: ["always", "tap", "off"].includes($("sListenMode").value) ? $("sListenMode").value : "always",
+      name: $("sName").value.trim() || DB.store.DEFAULTS.name,
       lang: $("sLang").value.trim() || DB.store.DEFAULTS.lang,
-      barge: $("sBarge").value,
       followUp: Math.max(0, Math.min(30, Math.round(num("sFollow", 8)))),
       voiceURI: $("sVoice").value,
       rate: num("sRate", 1), pitch: num("sPitch", 1),
       camera: $("sCamera").value, motion: $("sMotion").checked, preview: $("sPreview").checked,
       sttEngine: "browser", ttsEngine: "browser",                  // local server isn't built yet
       wakeLock: $("sWakeLock").checked,
+      face: $("sFace").value === "eye" ? "eye" : "ball",
       sleepyMinutes: Math.max(1, Math.min(120, Math.round(num("sSleepy", 3)))),
     });
     const key = $("sKey").value; $("sKey").value = "";
@@ -426,9 +549,12 @@
   });
   function applySettings(prev) {
     stt.setLang(settings.lang);
+    if (settings.face !== prev.face) setFace(settings.face);
     if (st.started) {
-      if (settings.alwaysListen && !stt.running) stt.start();
-      if (!settings.alwaysListen && prev.alwaysListen) stt.stop();
+      if (settings.listenMode !== prev.listenMode) {
+        if (settings.listenMode === "always") ensureMic();
+        else { vad.stop(); clearTimeout(st.pendingStart); if (settings.listenMode === "off" && stt.running) stt.abort(); }
+      }
       if (settings.camera !== prev.camera) {
         if (settings.camera === "off") cam.stop();
         else cam.start(settings.camera).catch((e) => showSaid("Camera: " + (e.message || e.name))).then(updateCamButtons);
@@ -475,21 +601,21 @@
     $("startOverlay").hidden = true;
     activity("tap");
     requestWakeLock();
-    if (settings.alwaysListen) stt.start();
+    ensureMic();          // "always" mode: open the mic stream once; recognition only starts when a voice is heard
     if (settings.camera !== "off") {
       try { await cam.start(settings.camera); } catch (e) { showSaid("Camera: " + (e.message || e.name)); }
     }
     updateCamButtons();
     eye.setMood("happy", 2.5);
-    const hi = DB.store.getKey()
-      ? 'Hi! Say "' + settings.wakeWord + '" when you need me.'
-      : "Hi! Add a Claude API key in settings so I can think.";
+    const hi = !DB.store.getKey() ? "Hi! Add a Claude API key in settings so I can think."
+      : settings.listenMode === "always" ? 'Hi! Say "' + settings.wakeWord + '" when you need me.'
+      : "Hi! Press the microphone when you need me.";
     say(hi, true);
     idleStatus();
   }
   $("btnStart").addEventListener("click", start);
   if (!window.isSecureContext) $("secureWarn").hidden = false;
-  if (!stt.supported) showHeard("Speech recognition isn't available in this browser. Use Chrome; the buttons still work.", "");
+  if (!stt.supported) showSaid("Speech recognition isn't available in this browser. Use Chrome; the buttons still work.", true);
 
   wireSTT(); wireTTS(); fillVoices(); updateCamButtons(); idleStatus();
 
@@ -498,6 +624,6 @@
   }
 
   // For debugging and the automated tests. Nothing here exposes the API key.
-  window.deskBuddy = { eye, cam, brain, get stt() { return stt; }, get tts() { return tts; }, get settings() { return settings; },
-                       state: st, handleFinal, runCommand, afterWake, start };
+  window.deskBuddy = { get eye() { return eye; }, setFace, cam, brain, vad, get stt() { return stt; }, get tts() { return tts; }, get settings() { return settings; },
+                       state: st, handleFinal, runCommand, afterWake, isEcho, echoScore, muted, startRecognition, showHeard, showSaid, start };
 })();
