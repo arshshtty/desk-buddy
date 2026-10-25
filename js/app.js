@@ -26,7 +26,7 @@
     eye.adopt(old);
   }
   const cam = new DB.Camera($("preview"));
-  let tts = DB.makeTTS(settings.ttsEngine);
+  const tts = new DB.MultiTTS(DB.makeTTS("browser"), () => settings);   // system voice, or the optional natural voice (v7)
   const notesApi = { add: (t) => DB.store.addNote(t), list: () => DB.store.notes() };
   const brain = new DB.Brain(() => settings, () => DB.store.getKey(), notesApi);
   const vad = new DB.VoiceDetector();
@@ -51,6 +51,8 @@
   const isWhisper = () => stt.kind === "whisper";
 
   const COOLDOWN_MS = 2000;     // recognition starts at most once every 2 s (each start beeps on Android)
+  const ALONE_MS = 800;         // v7: an interim that's only the wake word, steady this long, counts as "said alone"
+  const SNAP_SIDE = 640, SNAP_Q = 0.7;   // v7: the snapshot sent with each question
   const AWAIT_MS = 8000;        // after the wake word on its own, the next thing you say is for Buddy
   const TAIL_MS = 800;          // keep ignoring the mic this long after Buddy stops talking
   const BARGE_TAIL_MS = 300;    // shorter when the speech was cut off by a tap
@@ -143,7 +145,14 @@
   }
   // interim: true = faint (still hearing you, or not for Buddy); "partial" = recognition still in progress
   function showHeard(text, interim) { captionLine($("heard"), "heard", "You", text, interim ? "interim" + (interim === "partial" ? " partial" : "") : ""); }
-  function showSaid(text, aside) { captionLine($("said"), "said", (settings.name || "Buddy").trim() || "Buddy", text, aside ? "aside" : ""); }
+  function showSaid(text, aside) { captionLine($("said"), "said", assistantName(), text, aside ? "aside" : ""); }
+  /** The name on the reply captions: Settings > Name, else the first wake word ("buddy" -> "Buddy"). */
+  function assistantName() {
+    const n = String(settings.name || "").trim();
+    if (n) return n;
+    const w = (wakeList()[0] || ["buddy"]).join(" ");
+    return w.replace(/(^|\s)\S/g, (c) => c.toUpperCase());
+  }
 
   function tokens(s) {
     return String(s).toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, " ").split(/\s+/).filter(Boolean);
@@ -474,6 +483,7 @@
     stt.onResult = (text, isFinal, meta) => {
       if (isFinal) st.lastTranscript = text;
       if (muted()) { if (isFinal) st.drops.muted++; return; }
+      clearTimeout(st.aloneTimer); st.aloneTimer = 0;
       if (!isFinal) {
         if (isEcho(text)) return;
         showHeard(text, "partial");
@@ -481,6 +491,12 @@
         if (!st.interimWake && wakeNeeded() && !listeningForCommand()) {
           const m = matchWake(text);
           if (m) { st.interimWake = m; eye.setListening(true); setStatus("Listening…", "wake"); }
+        }
+        // v7: the wake word on its own, and nothing more for a moment: answer now ("Yes?"), don't wait for a final
+        // (iPhone often keeps a lone "buddy" as an interim and never finalises it).
+        if (wakeNeeded() && !listeningForCommand()) {
+          const m = matchWake(text);
+          if (m && m.rest === "") st.aloneTimer = setTimeout(() => { st.aloneTimer = 0; wakeAloneEarly(m, text); }, ALONE_MS);
         }
         return;
       }
@@ -546,11 +562,15 @@
       noteWake(wake.path, wake, text);
       if (wakeRest) cmd = wakeRest;
       else {
+        // Already acknowledged from the interim (v7): this final is the same "buddy"; keep the window open, no second chime.
+        if (st.aloneEarly && now - st.aloneEarly < AWAIT_MS + 2000) {
+          st.aloneEarly = 0;
+          st.awaitUntil = Math.max(st.awaitUntil, now + AWAIT_MS); eye.setListening(true); idleStatus();
+          return "wake";
+        }
         // Said on its own: acknowledge (chime / "Yes?") and listen for the question without the wake word.
-        st.awaitUntil = now + AWAIT_MS;
-        eye.setMood("curious", 8); eye.setListening(true); idleStatus();
+        openAwait();
         ackWake();
-        setTimeout(() => { if (Date.now() >= st.awaitUntil) { eye.setListening(listeningForCommand()); idleStatus(); } }, AWAIT_MS + 100);
         return "wake";
       }
     } else if (followOpen || !wakeNeeded()) {
@@ -572,11 +592,27 @@
       return "ignored";
     }
     setPhase("heard");
-    st.awaitUntil = st.pttUntil = st.followUntil = 0;
+    st.awaitUntil = st.pttUntil = st.followUntil = 0; st.aloneEarly = 0;
     eye.setListening(false);
     $("btnTalk").classList.remove("active");
     runCommand(cmd);
     return "command";
+  }
+  /** The wake word said alone, seen in a steady interim: acknowledge and open the window for the question. */
+  function wakeAloneEarly(m, text) {
+    if (muted() || listeningForCommand()) return;
+    st.aloneEarly = Date.now();
+    st.aloneEarlyCount = (st.aloneEarlyCount || 0) + 1;
+    activity("speech");
+    noteWake("alone (from the interim)", m, text);
+    openAwait();
+    ackWake();
+  }
+  function openAwait() {
+    const now = Date.now();
+    st.awaitUntil = now + AWAIT_MS;
+    eye.setMood("curious", 8); eye.setListening(true); idleStatus();
+    setTimeout(() => { if (Date.now() >= st.awaitUntil) { eye.setListening(listeningForCommand()); idleStatus(); } }, AWAIT_MS + 100);
   }
   /** Remember which wake rule fired, for the diagnostics strip. */
   function noteWake(path, wake, text) {
@@ -645,7 +681,16 @@
     if (SLEEP_RE.test(cmd)) { await say("Goodnight.", true); eye.sleep(); $("controls").classList.add("dim"); return; }
     if (FORGET_RE.test(cmd)) { brain.forget(); eye.setMood("surprised", 1.5); return say("Okay, fresh start."); }
     if (LOOK_RE.test(cmd)) return look(cmd);
-    return ask(cmd, null);
+    return ask(cmd, null, await snapshot());
+  }
+  /** v7: a current camera frame for this question (when the camera's on and "Send a camera snapshot" is ticked). */
+  async function snapshot() {
+    if (!settings.snapshot) return { image: null, why: "snapshots are turned off in Settings" };
+    if (!cam.on) return { image: null, why: st.camError ? "the camera isn't working: " + st.camError : "the camera is off" };
+    try {
+      const image = await Promise.race([cam.grab(SNAP_SIDE, SNAP_Q), new Promise((_, rej) => setTimeout(() => rej(new Error("the camera took too long")), 3000))]);
+      return { image, why: "" };
+    } catch (e) { logEvent("snapshot failed: " + ((e && e.message) || e)); return { image: null, why: "the snapshot failed: " + ((e && e.message) || "error") }; }
   }
 
   async function look(question) {
@@ -663,15 +708,20 @@
       if (tempCam && (settings.camera === "off" || st.camError)) cam.stop();
       updateCamButtons();
     }
-    return ask(question || "What is this? Look at the picture and tell me briefly.", image);
+    return ask(question || "What is this? Look at the picture and tell me briefly.", image, { image, why: "" });
   }
 
-  async function ask(text, image) {
+  async function ask(text, image, snap) {
     const my = ++st.askToken;
     setPhase("thinking");
     eye.setMood("thinking"); idleStatus();
+    if (snap && snap.image) image = snap.image;
+    const g = image && cam.lastGrab;
+    const imageInfo = image ? "image sent" + (g ? " " + g.w + "x" + g.h + ", " + Math.round(g.bytes / 1024) + " KB" : "") : snap ? "no image (" + snap.why + ")" : "no image";
+    st.lastImage = { sent: !!image, info: imageInfo, at: Date.now() };
     try {
-      const reply = await brain.ask(text, image);
+      const reply = await brain.ask(text, image, { camera: image ? "attached" : snap ? snap.why : "", facing: cam.facing === "environment" ? "back" : "front",
+                                                   imageInfo, name: assistantName(), wake: primaryWake() });
       if (my !== st.askToken) return;
       eye.setMood(reply.mood || "neutral", 6);
       await say(reply.text);
@@ -806,7 +856,8 @@
   function updateCamButtons() {
     $("btnCam").classList.toggle("active", cam.on);
     $("btnFlip").title = "Switch camera (now " + (cam.facing === "user" ? "front" : "back") + ")";
-    $("preview").hidden = !(cam.on && settings.preview);
+    $("preview").hidden = false;
+    $("preview").classList.toggle("offscreen", !(cam.on && settings.preview));   // stays in the page so iPhone keeps frames coming
     $("camDot").hidden = !cam.on;
     cam.motionOn = !!settings.motion;
     if (!settings.faceDetect) cam.detector = null;
@@ -950,7 +1001,8 @@
     const sel = $("sVoice"), cur = settings.voiceURI;
     const list = tts.voices().slice().sort((a, b) => a.lang.localeCompare(b.lang) || a.name.localeCompare(b.name));
     sel.textContent = "";
-    const def = document.createElement("option"); def.value = ""; def.textContent = "Browser default"; sel.appendChild(def);
+    const best = tts.browser.bestVoice ? tts.browser.bestVoice(settings.lang) : null;
+    const def = document.createElement("option"); def.value = ""; def.textContent = "Automatic" + (best ? " (best here: " + best.name + ")" : " (browser default)"); sel.appendChild(def);
     for (const v of list) {
       const o = document.createElement("option");
       o.value = v.id; o.textContent = v.name + " (" + v.lang + ")" + (v.local ? "" : " · online");
@@ -969,10 +1021,12 @@
     $("sName").value = s.name; $("sFollow").value = s.followUp;
     fillVoices();
     $("sRate").value = s.rate; $("sPitch").value = s.pitch; $("oRate").textContent = (+s.rate).toFixed(2); $("oPitch").textContent = (+s.pitch).toFixed(2);
-    $("sCamera").value = s.camera; $("sMotion").checked = s.motion; $("sPreview").checked = s.preview;
+    $("sCamera").value = s.camera; $("sMotion").checked = s.motion; $("sPreview").checked = s.preview; $("sSnapshot").checked = s.snapshot !== false;
+    $("sName").placeholder = assistantName();
+    fillKokoro(); $("sVoiceEngine").value = s.voiceEngine; $("sKokoroVoice").value = s.kokoroVoice; $("sKokoroDevice").value = s.kokoroDevice; kokoroUi();
     $("sFaceDetect").checked = s.faceDetect; $("sGreetHi").checked = s.greetHi; $("sGreetMin").value = s.greetMinutes;
     $("sGlances").value = s.glances; $("sGlanceMin").value = s.glanceMinutes;
-    $("sSttEngine").value = s.sttEngine; $("sTtsEngine").value = s.ttsEngine; $("sLocalUrl").value = s.localUrl;
+    $("sSttEngine").value = s.sttEngine; $("sLocalUrl").value = s.localUrl;
     $("sWhisperModel").value = s.whisperModel; $("sSrMode").value = s.srMode;
     $("sSens").value = s.sensitivity; $("oSens").textContent = s.sensitivity; $("sMicProc").value = s.micProcessing;
     $("sDiag").checked = s.diagnostics;
@@ -994,9 +1048,37 @@
   $("btnClearKey").addEventListener("click", () => { DB.store.clearKey(); $("sKey").value = ""; keyState(); });
   $("btnResetSystem").addEventListener("click", () => { $("sSystem").value = DB.store.DEFAULT_SYSTEM; });
   $("btnTestVoice").addEventListener("click", () => {
-    rememberSaid("Hi, I'm your desk buddy.");
-    tts.speak("Hi, I'm your desk buddy.", { voice: $("sVoice").value, rate: +$("sRate").value, pitch: +$("sPitch").value, lang: $("sLang").value });
+    const line = "Hi, I'm " + ($("sName").value.trim() || assistantName()) + ". This is how I sound.";
+    rememberSaid(line);
+    tts.unlock();
+    const natural = $("sVoiceEngine").value === "kokoro";
+    if (natural && tts.kokoro.state !== "ready") { kokoroDownload(); $("kokoroState").textContent = "Downloading the natural voice first; Preview again when it's ready. Meanwhile, the system voice:"; }
+    tts.speak(line, { voice: $("sVoice").value, rate: +$("sRate").value, pitch: +$("sPitch").value, lang: $("sLang").value,
+                      engine: natural && tts.kokoro.state === "ready" ? "kokoro" : "system", kokoroVoice: $("sKokoroVoice").value });
   });
+  /* natural voice (Kokoro) controls */
+  function fillKokoro() {
+    const sel = $("sKokoroVoice");
+    if (sel.options.length) return;
+    for (const id in DB.KOKORO_VOICES) { const o = document.createElement("option"); o.value = id; o.textContent = DB.KOKORO_VOICES[id]; sel.appendChild(o); }
+  }
+  function kokoroUi() {
+    const k = tts.kokoro, on = $("sVoiceEngine").value === "kokoro";
+    $("kokoroBox").hidden = !on;
+    const p = k.progress;
+    $("kokoroProg").hidden = k.state !== "loading";
+    if (p.total) { $("kokoroProg").max = p.total; $("kokoroProg").value = p.loaded; } else $("kokoroProg").removeAttribute("value");
+    $("kokoroState").textContent = "Natural voice: " + k.statusText() + "." + (k.supported ? "" : " This browser can't run it.");
+  }
+  function kokoroDownload() {
+    tts.kokoro.unlock();
+    tts.kokoro.load($("sKokoroDevice").value).then(kokoroUi, (e) => { kokoroUi(); logEvent("natural voice: " + e.message); });
+    kokoroUi();
+  }
+  tts.kokoro.onProgress = () => { if ($("settingsDlg").open) kokoroUi(); };
+  tts.kokoro.onState = () => { if ($("settingsDlg").open) kokoroUi(); };
+  $("sVoiceEngine").addEventListener("change", () => { if ($("sVoiceEngine").value === "kokoro") kokoroDownload(); kokoroUi(); });
+  $("btnKokoroLoad").addEventListener("click", kokoroDownload);
   $("settingsDlg").addEventListener("close", () => {
     if ($("settingsDlg").returnValue !== "save") { $("sKey").value = ""; return; }
     const prev = settings;
@@ -1007,10 +1089,14 @@
       system: $("sSystem").value.trim() || DB.store.DEFAULT_SYSTEM,
       memory: Math.max(0, Math.min(20, Math.round(num("sMemory", 6)))),
       wakeWord: $("sWake").value.trim() || DB.store.DEFAULTS.wakeWord,
+      snapshot: $("sSnapshot").checked,
+      voiceEngine: $("sVoiceEngine").value === "kokoro" ? "kokoro" : "system",
+      kokoroVoice: $("sKokoroVoice").value in DB.KOKORO_VOICES ? $("sKokoroVoice").value : "af_heart",
+      kokoroDevice: $("sKokoroDevice").value === "webgpu" ? "webgpu" : "auto",
       wakeAck: ["chime", "yes", "none"].includes($("sWakeAck").value) ? $("sWakeAck").value : "chime",
       wakeMode: ["on", "conversation", "off"].includes($("sWakeMode").value) ? $("sWakeMode").value : "on",
       listenMode: ["always", "tap", "off"].includes($("sListenMode").value) ? $("sListenMode").value : "always",
-      name: $("sName").value.trim() || DB.store.DEFAULTS.name,
+      name: $("sName").value.trim(),
       lang: $("sLang").value.trim() || DB.store.DEFAULTS.lang,
       followUp: Math.max(0, Math.min(30, Math.round(num("sFollow", 8)))),
       voiceURI: $("sVoice").value,
@@ -1026,7 +1112,7 @@
       sensitivity: Math.max(1, Math.min(10, Math.round(num("sSens", 6)))),
       micProcessing: $("sMicProc").value in DB.VoiceDetector.PROCESSING ? $("sMicProc").value : "balanced",
       diagnostics: $("sDiag").checked,
-      ttsEngine: "browser",                                        // local server isn't built yet
+      ttsEngine: "browser",
       wakeLock: $("sWakeLock").checked,
       face: $("sFace").value === "eye" ? "eye" : "sphere",
       sleepyMinutes: Math.max(1, Math.min(120, Math.round(num("sSleepy", 3)))),
@@ -1142,9 +1228,10 @@
     $("dReply").textContent = "reply: " + st.phase + (st.phase !== "idle" ? " " + Math.round((Date.now() - st.phaseAt) / 1000) + " s" : "") +
       " · wake word " + (settings.wakeMode === "on" ? "required" : settings.wakeMode === "off" ? "off" : wakeNeeded() ? "required (nobody on camera)" : "not needed (someone's here)") +
       (listeningForCommand() ? " · follow-up open" : "") +
-      " · claude " + (!DB.store.getKey() ? "no key" : b ? (b.ok ? "ok " + (b.ms / 1000).toFixed(1) + " s" : b.text.slice(0, 90)) : "not asked yet") +
+      " · claude " + (!DB.store.getKey() ? "no key" : b ? (b.ok ? "ok " + (b.ms / 1000).toFixed(1) + " s" : b.text.slice(0, 90)) + (b.imageInfo ? ", " + b.imageInfo : "") : "not asked yet") +
       " · voice out " + (tts.supported ? (tts.voiceUsed || "default") + ", " + nv + " voices" + (st.lastReply ? ", last " + st.lastReply : "") +
-        (tts.lastError && Date.now() - tts.lastErrorAt < 120000 ? ", error: " + tts.lastError : "") : "unsupported");
+        (tts.lastError && Date.now() - tts.lastErrorAt < 120000 ? ", error: " + tts.lastError : "") : "unsupported") +
+      (settings.voiceEngine === "kokoro" ? " · natural voice " + tts.kokoro.statusText() : "");
     const lw = st.lastWake;
     $("dWake").textContent = "wake words: " + wakeList().map((w) => w.join(" ")).join(", ") + " · last match: " +
       (!lw ? "none yet" : (lw.path === "none" ? "none (no wake word in \u201c" + lw.text.slice(0, 40) + "\u201d)" :
@@ -1181,6 +1268,7 @@
   async function start() {
     if (st.started) return;
     tts.unlock();                         // must happen inside the tap: Android won't speak otherwise
+    if (settings.voiceEngine === "kokoro") tts.kokoro.load(settings.kokoroDevice).catch((e) => logEvent("natural voice: " + e.message));
     st.started = true;
     $("startOverlay").hidden = true;
     activity("tap");
@@ -1210,7 +1298,7 @@
   }
 
   // For debugging and the automated tests. Nothing here exposes the API key.
-  window.deskBuddy = { get eye() { return eye; }, setFace, cam, brain, vad, get stt() { return stt; }, get tts() { return tts; }, get settings() { return settings; },
+  window.deskBuddy = { assistantName, snapshot, wakeAloneEarly, get eye() { return eye; }, setFace, cam, brain, vad, get stt() { return stt; }, get tts() { return tts; }, get settings() { return settings; },
                        state: st, handleFinal, runCommand, afterWake, matchWake, wakeList, soundKey, skeleton, wakeNeeded, chime, setPhase, isEcho, echoScore, muted, startRecognition, showHeard, showSaid, start,
                        say, micState, engineText, calibrate, maybeGlance, runContinuous, srFailure, get strategy() { return st.strategy; } };
 })();

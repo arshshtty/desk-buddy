@@ -39,7 +39,7 @@
     <div id="said" class="line said"></div>
   </div>
 
-  <video id="preview" playsinline muted autoplay hidden></video>
+  <video id="preview" class="offscreen" playsinline muted autoplay></video>
 
   <nav id="controls" aria-label="Controls">
     <button id="btnTalk" class="big" title="Push to talk (or press space)" aria-label="Push to talk">🎙️</button>
@@ -144,7 +144,7 @@
           </select>
         </label>
         <label class="check"><input id="sDiag" type="checkbox"> Show the diagnostics strip (mic level, state, last event)</label>
-        <label>Buddy's name (shown in the captions)
+        <label>Name (shown on the reply captions; leave empty to use the first wake word)
           <input id="sName" autocomplete="off" spellcheck="false" placeholder="Buddy">
         </label>
         <label>Speech language
@@ -158,16 +158,38 @@
 
       <fieldset>
         <legend>Voice</legend>
-        <label>Voice
+        <label>Voice engine
+          <select id="sVoiceEngine">
+            <option value="system">This device's voices (default)</option>
+            <option value="kokoro">Natural voice: Kokoro, on this device (downloads about 92 MB once)</option>
+          </select>
+        </label>
+        <div id="kokoroBox" hidden>
+          <label>Natural voice
+            <select id="sKokoroVoice"></select>
+          </label>
+          <label>Runs on
+            <select id="sKokoroDevice">
+              <option value="auto">Processor (WASM, 92 MB download; default)</option>
+              <option value="webgpu">Graphics (WebGPU where available, 326 MB download)</option>
+            </select>
+          </label>
+          <progress id="kokoroProg" hidden></progress>
+          <p class="muted small" id="kokoroState"></p>
+          <button type="button" id="btnKokoroLoad">Download natural voice</button>
+          <p class="muted small">Kokoro-82M is an open-source voice model (Apache-2.0). It runs entirely on this device: the model downloads once from Hugging Face and is kept in this browser. It needs a fairly fast phone; if it can't keep up with real time, Buddy switches to the system voice by itself and says so in the diagnostics strip. Rate applies; pitch doesn't.</p>
+        </div>
+        <label>System voice
           <select id="sVoice"></select>
         </label>
+        <p class="muted small">"Automatic" picks the best voice this device has (Premium, Enhanced or Neural voices first; Australian, then British, then American English). On iPhone, download better voices in Settings › Accessibility › Spoken Content › Voices › English (choose an Enhanced or Premium voice); Siri's own voices aren't available to web pages.</p>
         <label>Rate <output id="oRate"></output>
           <input id="sRate" type="range" min="0.5" max="2" step="0.05">
         </label>
         <label>Pitch <output id="oPitch"></output>
           <input id="sPitch" type="range" min="0" max="2" step="0.05">
         </label>
-        <button type="button" id="btnTestVoice">Test voice</button>
+        <button type="button" id="btnTestVoice">Preview voice</button>
       </fieldset>
 
       <fieldset>
@@ -179,7 +201,9 @@
             <option value="off">Off until I press Look</option>
           </select>
         </label>
-        <p class="muted small">With the camera on, the face reacts to what it sees: the eyes follow you, it says hello when you come back, gets sleepy in the dark and wakes when the lights come on. This is worked out on this device from a tiny 160×120 picture; nothing is sent anywhere. The camera pauses when this page is hidden.</p>
+        <p class="muted small">With the camera on, the face reacts to what it sees: the eyes follow you, it says hello when you come back, gets sleepy in the dark and wakes when the lights come on. This is worked out on this device from a tiny 160×120 picture, and none of it is sent anywhere. The camera pauses when this page is hidden.</p>
+        <label class="check"><input id="sSnapshot" type="checkbox"> Send a camera snapshot with each question (default on)</label>
+        <p class="muted small">When you ask Buddy something while the camera is on, one picture (640 px, about 30–60 KB) goes to Claude with the question, so it can answer things like "what's this?" or "how do I look?". That adds roughly 400 input tokens per question (width × height ÷ 750). Questions about what Buddy can see ("what am I holding?", "look at this") always send a picture.</p>
         <label class="check"><input id="sMotion" type="checkbox"> Follow motion with the eyes</label>
         <label class="check"><input id="sFaceDetect" type="checkbox"> Look at faces (on-device face detector, where the browser has one)</label>
         <p class="muted small" id="faceDetState"></p>
@@ -223,12 +247,6 @@
             <option value="shared">Shared: recognition and the voice detector share the mic</option>
             <option value="release">Release: close the voice detector's mic while recognising</option>
             <option value="continuous">Continuous: always-on recognition (beeps on Android)</option>
-          </select>
-        </label>
-        <label>Text to speech
-          <select id="sTtsEngine">
-            <option value="browser">Browser (speechSynthesis)</option>
-            <option value="local" disabled>Local server: Kokoro (coming later)</option>
           </select>
         </label>
         <label>Local server URL
@@ -280,6 +298,7 @@
   <script src="js/vad.js"></script>
   <script src="js/camera.js"></script>
   <script src="js/brain.js"></script>
+  <script src="js/kokoro.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

@@ -29,7 +29,9 @@ A plain `http://192.168.x.x:8000` address from another device is **not** secure,
    - "Jarvis, go to sleep" · "Jarvis, start over" (forget the conversation)
 4. Tap the eye to poke it, stroke it to pet it, and tap it (or press Esc) while it's talking to stop it.
 
-Captions show **You:** (right, blue) for what it heard from you and **Buddy:** (left; the name is a setting) for its replies.
+Captions show **You:** (right, blue) for what it heard from you and the assistant's name (left) for its replies. The name is
+Settings → **Name**; left empty (the default) it's the first wake word, capitalised ("buddy" → **Buddy:**). Updating to v7 clears an
+old saved name that isn't one of your wake words, so the label matches what you call it.
 
 ## Faces
 
@@ -55,8 +57,16 @@ Settings → Camera → **Camera on at start** (front camera by default; back, o
 A small red **● cam** next to the status shows when it's on, and it pauses whenever the page is hidden.
 If you refuse the camera permission, Buddy says so once and carries on with voice only.
 
-The face reacts to what it sees. All of this runs on the device from a 160×120 picture at about 8 frames a second
-(2 a second while asleep), and **nothing is sent to Claude automatically**:
+**Snapshot with each question** (Settings → Camera, on by default): while the camera is on, every question you ask Buddy goes to
+Claude with one current camera frame (a 640 px JPEG at quality 0.7, typically 30 to 60 KB, roughly 400 input tokens), so it can
+answer "what's this?" or "how do I look?" without a special phrase. The system prompt tells Claude it's a live snapshot from the desk
+camera (front or back), or says plainly that no picture came with this question and why (camera off, snapshots off, or the grab failed).
+Questions about what it can see ("what am I holding", "look at this", 👁️) always send a picture, turning the camera on briefly if
+needed. The diagnostics `reply:` line shows `image sent 640x480, 41 KB` or `no image (…)`. On iPhone the video element stays in the
+page (tiny and invisible) when the preview is off, so WebKit keeps decoding frames, and the grab waits until a frame is ready.
+
+The face also reacts to what it sees. That part runs on the device from a 160×120 picture at about 8 frames a second
+(2 a second while asleep), and **none of it is sent anywhere**:
 
 - the eyes follow movement, or a face where the browser has the on-device `FaceDetector` (not every browser does; without it, motion only);
 - when someone comes back after two minutes or more it looks happy, with an optional spoken "Hi!" at most every N minutes (off by default);
@@ -135,6 +145,30 @@ for the chime, then ask; or put it at the end; or turn it off. The diagnostics s
 matched last (`alone`, `start`, `after-greeting`, `start-fuzzy`, `near-start`, `split`, `middle`, `end`, `interim (…)`,
 `after the wake word alone`, `follow-up`, or `none`).
 
+## Voice
+
+Settings → Voice:
+
+- **System voice: Automatic** (default) picks the best voice the device has: Premium, Enhanced, Neural or Natural voices
+  first, then well-known good ones (Siri, Google UK/US English, Karen, Samantha, Daniel, Ava, Zoe, …), in your speech language
+  first, then Australian, British and American English. Novelty voices (Albert, Bad News, Zarvox, …) are never picked.
+  You can choose any voice yourself; **Preview voice** plays a sample with the Rate and Pitch sliders.
+- **On iPhone**, download a better voice first: iOS Settings → Accessibility → Spoken Content → Voices → English, then pick an
+  **Enhanced** or **Premium** voice (for example Karen or Lee for Australian English) and download it. Reload Desk Buddy and
+  Automatic will use it. Siri's own voices aren't available to web pages.
+- **Natural voice (Kokoro)**, off by default: [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) through
+  [kokoro-js](https://www.npmjs.com/package/kokoro-js) (both Apache-2.0), running on the device in a Web Worker. The first time,
+  it downloads the 92 MB quantised model (q8) plus a 0.5 MB voice from Hugging Face, with a progress bar; after that it's kept
+  in the browser. The ONNX Runtime WebAssembly file (27 MB, the same one Whisper uses) comes from this site. Replies are
+  generated a sentence at a time, the next one while the current one plays, and the mouth follows the audio's loudness.
+  The mic stays muted while it plays, as with the system voice. If the first sentence takes more than 1.25× as long to generate
+  as it lasts, Buddy switches to the system voice for that reply and the rest of the session, and the diagnostics strip says
+  `natural voice … too slow here`. "Runs on: Graphics" uses WebGPU where available with the full 326 MB model (the
+  quantised model is reported to sound poor on WebGPU). Measured on the build box (8-core cloud VM, headless Chrome, one
+  thread, no WebGPU): model load 20 to 25 s including the download, then 1.9 to 2.4× real time, so too slow there and it fell
+  back as designed. Speed on a phone is untested; recent iPhones and Pixels have faster single cores, but expect it to be
+  borderline on one thread.
+
 ### If it listens but doesn't answer
 
 Look at the `reply:` line in the diagnostics strip:
@@ -170,6 +204,8 @@ Claude picks a mood by starting its reply with a `[mood]` tag.
 | `js/adapters.js` | **STT/TTS adapter interface**: Web Speech (one session per utterance, or continuous), `LocalServerSTT` / `LocalServerTTS` stubs |
 | `js/whisper.js`, `js/whisper-worker.js` | On-device Whisper engine (same interface) and its module worker |
 | `js/vendor/transformers/` | transformers.js 4.3.1 and its ONNX Runtime WebAssembly files, self-hosted (licences included) |
+| `js/kokoro.js`, `js/kokoro-worker.js` | Optional natural voice: Kokoro playback with Web Audio, speed check and fallback (`MultiTTS` wraps the system voice), and its module worker |
+| `js/vendor/kokoro/` | kokoro-js 1.2.1 and phonemizer 1.2.1, self-hosted (Apache-2.0, licences and notes included) |
 | `js/vad.js`, `js/capture-worklet.js` | Voice-activity detector on one always-open mic stream, sensitivity and calibration; 16 kHz capture with pre-roll for Whisper |
 | `js/camera.js` | getUserMedia, front/back, JPEG grab, on-device perception: motion, faces, presence, light, startle |
 | `js/brain.js` | Anthropic Messages API from the browser, rolling memory, `save_note` / `list_notes` tools |
@@ -197,7 +233,9 @@ and `POST {url}/tts` with `{text, voice}` → `audio/wav` (Kokoro). On-device Wh
 - GitHub Pages can't send the headers for multi-threaded WebAssembly, so Whisper runs on one CPU thread unless WebGPU is available.
 - Web Speech can't be handed audio from before it started, so on phones the first word can be lost. The wake
   word is matched loosely at the start of a sentence ("arvis" counts as "Jarvis"); saying it by itself and waiting for the
-  chime, or putting it at the end, avoids the problem. In continuous mode recognition is restarted within about 60 ms
+  chime, or putting it at the end, avoids the problem. A wake word said on its own that stays an interim result for 0.8 s gets
+  the chime straight away, without waiting for a final result (iPhone often never sends one for a single short word); if you
+  keep talking, the words are joined into one question. In continuous mode recognition is restarted within about 60 ms
   of ending by itself so it's listening again almost at once; it still has to stop while Buddy talks.
   Desktop Chrome 135+ is given a 0.5 s delayed copy of the mic instead, so nothing is lost there.
 - Because the mic is ignored while Buddy talks, you can't interrupt it by voice. Tap the eye instead.
