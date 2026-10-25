@@ -50,6 +50,8 @@ html, body {
   object-fit: cover; border-radius: 10px; border: 1px solid var(--line); background: #000; opacity: 0.85;
 }
 #preview.mirror { transform: scaleX(-1); }
+/* v7: when the preview is off the video stays in the page (tiny and invisible) so iPhone keeps decoding frames for snapshots. */
+#preview.offscreen { width: 2px; height: 2px; top: 0; right: 0; opacity: 0.01; border: 0; pointer-events: none; }
 
 #controls {
   position: fixed; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 14px);

@@ -21,9 +21,9 @@
     effort: "low",
     system: DEFAULT_SYSTEM,
     memory: 6,
-    v: 4,                    // settings version (for migrations)
+    v: 5,                    // settings version (for migrations)
     face: "sphere",          // "sphere" (default) or "eye" (Classic eye)
-    name: "Buddy",           // shown in the captions as "Buddy: ..."
+    name: "",                // shown in the captions ("Buddy: ..."); empty = the first wake word
     wakeWord: "Jarvis",
     wakeAck: "chime",        // after the wake word on its own: "chime" | "yes" (says "Yes?") | "none"
     wakeMode: "on",          // require the wake word: "on" | "conversation" (not while someone is on camera) | "off"
@@ -33,9 +33,13 @@
     voiceURI: "",
     rate: 1.05,
     pitch: 1.1,
+    voiceEngine: "system",   // "system" (the phone's voices) | "kokoro" (natural voice, downloads ~92 MB once)
+    kokoroVoice: "af_heart",
+    kokoroDevice: "auto",    // "auto" (WASM) | "webgpu" (needs a 326 MB download)
     camera: "user",          // camera on at start: "user" (front), "environment" (back) or "off"
     motion: true,            // eyes follow motion / a face
     preview: false,
+    snapshot: true,          // send a camera snapshot with each question while the camera is on
     faceDetect: true,        // use the browser's FaceDetector where it exists (on-device)
     greetHi: false,          // say "hi" when someone comes back (at most every greetMinutes)
     greetMinutes: 10,
@@ -74,7 +78,17 @@
         if (s.sttEngine === "browser" || s.sttEngine === "local") s.sttEngine = "auto";
         s.v = 4;
       }
+      // v5 (app v7): the caption name follows the wake word unless it's set to one of the wake words.
+      if (!(saved.v >= 5)) {
+        const words = String(s.wakeWord || "").toLowerCase().split(",").map((w) => w.trim().replace(/^(hey|hi|ok|okay|yo)\s+/, "")).filter(Boolean);
+        if (!words.includes(String(s.name || "").trim().toLowerCase())) s.name = "";
+        s.v = 5;
+      }
       if (s.face !== "eye") s.face = "sphere";
+      if (!["system", "kokoro"].includes(s.voiceEngine)) s.voiceEngine = "system";
+      if (!["auto", "webgpu"].includes(s.kokoroDevice)) s.kokoroDevice = "auto";
+      if (!/^[a-z]{2}_[a-z]+$/.test(String(s.kokoroVoice))) s.kokoroVoice = "af_heart";
+      s.snapshot = s.snapshot !== false;
       if (!["on", "conversation", "off"].includes(s.wakeMode)) s.wakeMode = "on";
       if (!["chime", "yes", "none"].includes(s.wakeAck)) s.wakeAck = "chime";
       if (!["auto", "browser", "whisper"].includes(s.sttEngine)) s.sttEngine = "auto";

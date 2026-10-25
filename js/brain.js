@@ -64,10 +64,19 @@
     }
     forget() { this.history = []; }
 
-    _system(s) {
+    _system(s, opts) {
       const now = new Date();
-      return s.system + "\n\nCurrent local date and time: " + now.toLocaleString(undefined, { dateStyle: "full", timeStyle: "short" }) +
+      opts = opts || {};
+      let out = s.system + "\n\nCurrent local date and time: " + now.toLocaleString(undefined, { dateStyle: "full", timeStyle: "short" }) +
         ". The user has " + this.notes.list().length + " saved notes.";
+      if (opts.name) out += " Your name is " + opts.name + (opts.wake ? '; people get your attention by saying "' + opts.wake + '"' : "") + ".";
+      // v7: say plainly whether this question comes with a picture, so the reply never guesses.
+      if (opts.camera === "attached")
+        out += "\n\nCamera: the image attached to the user's latest message is a live snapshot from your desk camera (" + (opts.facing || "front") +
+          " camera), taken the moment they finished speaking. Use it when the question is about what you can see, or when it helps; otherwise ignore it.";
+      else if (opts.camera)
+        out += "\n\nCamera: no camera image is attached to this message (" + opts.camera + "). If the user asks about what you can see, say you didn't get a picture this time and why, briefly.";
+      return out;
     }
 
     async _post(body, signal) {
@@ -128,7 +137,7 @@
       while (past.length && past[0].role !== "user") past.shift();
       const messages = past.map((m) => ({ role: m.role, content: m.content })).concat([{ role: "user", content: userContent }]);
 
-      const body = { model: s.model || DB.store.DEFAULTS.model, max_tokens: opts.maxTokens || 1024, system: this._system(s), tools: TOOLS, messages };
+      const body = { model: s.model || DB.store.DEFAULTS.model, max_tokens: opts.maxTokens || 1024, system: this._system(s, opts), tools: TOOLS, messages };
       // Effort (output_config.effort) is optional; if the model rejects it once, stop sending it for that model.
       if (s.effort && this.noEffortFor !== body.model) body.output_config = { effort: s.effort };
 
@@ -159,7 +168,7 @@
         }
         const reply = parseReply(rawText);
         if (!reply.text) reply.text = "Hmm, I lost my words there.";
-        this.last = { ok: true, ms: Date.now() - t0, at: Date.now(), text: "" };
+        this.last = { ok: true, ms: Date.now() - t0, at: Date.now(), text: "", image: !!image, imageInfo: opts.imageInfo || "" };
         // Rolling memory keeps plain text only; images aren't re-sent.
         if (opts.noHistory) return { text: reply.text, mood: reply.mood, raw: rawText };
         this.history.push({ role: "user", content: (image ? "[showed you a camera picture] " : "") + (text || "What do you see?") });
@@ -167,7 +176,7 @@
         if (this.history.length > 40) this.history = this.history.slice(-40);
         return { text: reply.text, mood: reply.mood, raw: rawText };
       } catch (e) {
-        this.last = { ok: false, ms: Date.now() - t0, at: Date.now(), text: (e.kind || "error") + (e.status ? " " + e.status : "") + ": " + (e.detail || e.message) };
+        this.last = { ok: false, ms: Date.now() - t0, at: Date.now(), image: !!image, imageInfo: opts.imageInfo || "", text: (e.kind || "error") + (e.status ? " " + e.status : "") + ": " + (e.detail || e.message) };
         throw e;
       } finally {
         clearTimeout(timer);

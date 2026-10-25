@@ -1,12 +1,12 @@
 /* Desk Buddy service worker: caches the app shell so it opens offline and can be installed.
    API calls (api.anthropic.com) and anything off this origin are never cached here. The Whisper model files
    (from huggingface.co) are cached by transformers.js in its own cache, which this worker leaves alone. */
-const CACHE = "desk-buddy-v6";
+const CACHE = "desk-buddy-v7";
 const SHELL = [
   "./", "./index.html", "./styles.css", "./manifest.webmanifest",
   "./js/store.js", "./js/eye.js", "./js/face-sphere.js", "./js/adapters.js", "./js/whisper.js", "./js/vad.js", "./js/camera.js",
-  "./js/brain.js", "./js/app.js", "./js/capture-worklet.js", "./js/whisper-worker.js",
-  // The Whisper runtime's 27 MB .wasm isn't precached: it's cached the first time Whisper is used.
+  "./js/brain.js", "./js/kokoro.js", "./js/app.js", "./js/capture-worklet.js", "./js/whisper-worker.js", "./js/kokoro-worker.js",
+  // The Whisper runtime's 27 MB .wasm and the natural-voice code (js/vendor/kokoro) aren't precached: they're cached the first time they're used.
   "./js/vendor/transformers/transformers.min.js", "./js/vendor/transformers/ort-wasm-simd-threaded.asyncify.mjs",
   "./icons/icon.svg", "./icons/icon-192.png", "./icons/icon-512.png", "./icons/icon-maskable-512.png",
 ];
