@@ -21,7 +21,8 @@ A plain `http://192.168.x.x:8000` address from another device is **not** secure,
 1. Tap **Start**. The first tap is needed so the browser allows speech, the mic, the camera and the screen wake lock.
 2. ⚙️ **Settings**: paste a Claude API key. Use a separate key with a low spend limit. It's saved only in this browser's
    localStorage and sent only to `api.anthropic.com`. **Clear key** removes it.
-3. Say **"Jarvis, …"** (the wake word can be changed), or press 🎙️ / Space and just talk.
+3. Say **"Jarvis, …"** (the wake word can be changed, and you can list several), or press 🎙️ / Space and just talk.
+   The wake word can also go at the end ("what's the time, Jarvis?"), or say it by itself, wait for the chime, then ask.
    For a few seconds after each reply you can follow up without the wake word.
    - "Jarvis, take a note: buy milk" · "Jarvis, read my notes" (📝 to view, delete, or export as .md)
    - "Jarvis, what is this?" / "look at this" / press 👁️: sends one camera frame to Claude
@@ -106,16 +107,40 @@ as an echo. After that, only a near-copy (85% or more) is dropped, so a follow-u
 
 **Wake word.** "Require the wake word" is Yes by default. Conversation mode answers everything while someone is on camera
 (it still needs the wake word when the camera is off). No answers everything it hears. After every reply there's a follow-up
-window (8 s by default) when no wake word is needed. The match is forgiving at the start of what you say, or after
-"hey"/"ok"/"um": Android often loses the first syllable, and Whisper-tiny mishears names. So "Jarvis," "Jervis",
-"Charvis", "arvis", "service", "travis" and "jar vis" all count, but "the service was slow" doesn't. When you're heard
-without the wake word, the words show faintly with a hint: say the wake word first, or turn it off.
+window (8 s by default) when no wake word is needed.
+
+- **Several wake words.** Separate them with commas: `Buddy, Hey Buddy, Jarvis`. A leading "hey"/"ok" is optional anyway.
+- **Anywhere in the sentence.** "Buddy, what's going on?", "Hey Buddy, …", "what's going on, Buddy?" and
+  "can you tell me, Buddy, what's going on?" all work. The words around the wake word are what gets asked.
+- **On its own.** Say just "Buddy": it plays a short chime (or says "Yes?", or nothing: Settings > "When you say just the
+  wake word"), shows "Yes?", the face looks attentive and the status says "Listening…". Whatever you say in the next 8 s
+  is for Buddy, no wake word needed. This is the most reliable way on phones that miss the first word.
+- **Forgiving matching.** Speech recognition often mishears or clips a name. Similar-sounding words count, judged by
+  spelling (edit distance) and by sound (a consonant key where d/t, b/p, g/k, v/f, s/z are treated alike). How close it
+  has to be depends on where it is: anything that sounds like it at the start, after "hey"/"ok"/"um", or said alone;
+  close matches at the end; only exact or near-exact matches in the middle. For "Buddy" that means "body", "buddie",
+  "bodie", "birdie", "buddy's", "bud", "butty", "bobby" and "but he" count at the start or alone, and "body"/"buddie"
+  at the end. Everyday words ("but", "about", "pretty", "daddy", "baby"…) never count unless they're the wake word itself,
+  and "but I…"/"but it…" don't count as "but he". For "Jarvis": "Jervis", "Charvis", "arvis", "service", "travis",
+  "jar vis" at the start, but not "the service was slow". A two-or-three-syllable name that isn't an everyday word gives
+  the fewest false wakes; a short everyday-sounding word like "Buddy" will now and then wake on "…my body".
+- **Interim results.** Web Speech sends partial transcripts while you talk. If any of them had the wake word, it counts,
+  even if the final transcript dropped it (seen on iPhone: "Buddy, what's going on" finalised as "what's going on").
+  Results are read from the first one not yet used, not from the browser's `resultIndex`, which WebKit moves past the
+  first words. In continuous mode a partial that stops changing for 1.5 s is used as the final, because WebKit
+  sometimes never marks it final.
+
+When you're heard without the wake word, the words show faintly with a hint: try saying the wake word by itself, wait
+for the chime, then ask; or put it at the end; or turn it off. The diagnostics strip shows the wake words and which rule
+matched last (`alone`, `start`, `after-greeting`, `start-fuzzy`, `near-start`, `split`, `middle`, `end`, `interim (…)`,
+`after the wake word alone`, `follow-up`, or `none`).
 
 ### If it listens but doesn't answer
 
 Look at the `reply:` line in the diagnostics strip:
-- **wake word required**, with a faint "You:" caption and the hint: the wake word wasn't recognised. Start with "Hey Jarvis",
-  or set "Require the wake word" to Conversation mode or No.
+- **wake word required**, with a faint "You:" caption and the hint: the wake word wasn't recognised. The `wake words:` line
+  shows what was matched. Say the wake word by itself and wait for the chime, put it at the end, add the way it gets
+  misheard as another wake word (e.g. `Buddy, Body`), or set "Require the wake word" to Conversation mode or No.
 - **claude …** shows the last call: `ok 1.8 s`, or the error (`auth 401`, `rate 429`, `model 404`, `network`, …). Every error is
   also spoken and captioned. If the model rejects the effort setting, Buddy retries once without it and stops sending it.
 - **voice out …** shows the voice used, how many voices the browser has loaded, and the last speech error. On Android Chrome:
@@ -170,13 +195,17 @@ and `POST {url}/tts` with `{text, voice}` → `audio/wav` (Kokoro). On-device Wh
 - On-device Whisper needs the model download (40 or 75 MB) the first time, and transcribes after you stop talking, so
   replies start a second or more later than with Web Speech. On an older phone, tiny.en is the one to use.
 - GitHub Pages can't send the headers for multi-threaded WebAssembly, so Whisper runs on one CPU thread unless WebGPU is available.
-- Web Speech can't be handed audio from before it started, so on Android the first syllable can be lost. The wake
-  word is matched loosely at the start of a sentence ("arvis" counts as "Jarvis"), and saying "Hey Jarvis" helps.
+- Web Speech can't be handed audio from before it started, so on phones the first word can be lost. The wake
+  word is matched loosely at the start of a sentence ("arvis" counts as "Jarvis"); saying it by itself and waiting for the
+  chime, or putting it at the end, avoids the problem. In continuous mode recognition is restarted within about 60 ms
+  of ending by itself so it's listening again almost at once; it still has to stop while Buddy talks.
   Desktop Chrome 135+ is given a 0.5 s delayed copy of the mic instead, so nothing is lost there.
 - Because the mic is ignored while Buddy talks, you can't interrupt it by voice. Tap the eye instead.
 - Echo cancellation in the browser is imperfect, which is why the mute and echo filter exist.
-- iOS/Safari isn't tested. Speech recognition there depends on Siri/Dictation, continuous listening is unreliable,
-  there's no Fullscreen API on iPhone, and the wake lock needs a recent iOS.
+- iPhone (Safari, and Chrome on iOS, which uses the same WebKit engine) is only partly tested: the fixes for its speech
+  results (resultIndex, partials that never become final) were written from a real-device report and tested with
+  simulated results, not on an iPhone. Speech recognition there depends on Siri/Dictation, there's no Fullscreen API on
+  iPhone, and the wake lock needs a recent iOS.
 - The camera's reactions are simple on-device heuristics (frame differences and brightness), tuned on a test machine, not a real room.
 - Chrome may pause the mic and camera when the screen turns off or the tab is in the background. Keep the app in front with the wake lock on.
 - The API key lives in the browser. Anyone with the device, or any script running on the same origin, could read it.
