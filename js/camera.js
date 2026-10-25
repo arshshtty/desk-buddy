@@ -45,6 +45,9 @@
         audio: false,
         video: { facingMode: { ideal: this.facing }, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15, max: 30 } },
       });
+      // iPhone: the video must be muted + inline to play without a tap, and it must be playing for drawImage to get pixels.
+      this.video.muted = true; this.video.playsInline = true; this.video.autoplay = true;
+      this.video.setAttribute("playsinline", ""); this.video.setAttribute("muted", "");
       this.video.srcObject = this.stream;
       this.video.classList.toggle("mirror", this.facing === "user");
       try { await this.video.play(); } catch (e) { /* autoplay is muted, so this normally works */ }
@@ -68,10 +71,12 @@
     setSlow(slow) { if (slow !== this.slow) { this.slow = slow; if (this.on) this._loop(); } }
     async ready(ms) {
       const v = this.video;
+      if (v.paused && this.stream) { try { await v.play(); } catch (e) { /* ignore */ } }
       if (v.readyState >= 2 && v.videoWidth) return true;
       return new Promise((res) => {
-        const t = setTimeout(() => res(false), ms || 2500);
-        v.addEventListener("loadeddata", () => { clearTimeout(t); res(true); }, { once: true });
+        const ok = () => { if (v.readyState >= 2 && v.videoWidth) { clearTimeout(t); v.removeEventListener("loadeddata", ok); v.removeEventListener("canplay", ok); res(true); } };
+        const t = setTimeout(() => { v.removeEventListener("loadeddata", ok); v.removeEventListener("canplay", ok); res(v.readyState >= 2 && !!v.videoWidth); }, ms || 2500);
+        v.addEventListener("loadeddata", ok); v.addEventListener("canplay", ok);
       });
     }
     /** JPEG of the current frame as base64 (no data: prefix), longest side <= maxSide. */
@@ -79,12 +84,15 @@
       if (!this.on) throw new Error("Camera is off");
       await this.ready();
       const v = this.video, w = v.videoWidth, h = v.videoHeight;
-      if (!w || !h) throw new Error("No camera frame yet");
+      if (!w || !h || v.readyState < 2) throw new Error("No camera frame yet");
       const k = Math.min(1, (maxSide || 768) / Math.max(w, h));
       const cv = document.createElement("canvas");
       cv.width = Math.round(w * k); cv.height = Math.round(h * k);
       cv.getContext("2d").drawImage(v, 0, 0, cv.width, cv.height);
-      return cv.toDataURL("image/jpeg", quality || 0.75).split(",")[1];
+      const data = cv.toDataURL("image/jpeg", quality || 0.75).split(",")[1];
+      if (!data || data.length < 200) throw new Error("The camera picture came out empty");
+      this.lastGrab = { w: cv.width, h: cv.height, bytes: Math.round(data.length * 0.75), at: Date.now(), facing: this.facing };
+      return data;
     }
 
     _loop() {

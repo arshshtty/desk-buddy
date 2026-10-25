@@ -45,7 +45,7 @@
       if (this.fatal || this.running) return false;
       const r = this._make(!!opts.continuous);
       this.rec = r; this.gotResult = false; this.source = opts.source || ""; this.lastInterim = ""; this.aborting = false;
-      this.consumed = 0; this.uttInterims = []; this.pendingLen = 0; clearTimeout(this.stableTimer);
+      this.consumed = 0; this.uttInterims = []; this.pendingLen = 0; this.held = null; clearTimeout(this.stableTimer);
       this.lastStart = Date.now(); this.starts++;
       this.running = true;                       // set now so nothing else starts a second session
       let ok = false;
@@ -87,12 +87,21 @@
       r.onresult = (ev) => {
         if (r !== this.rec) return;
         const res = ev.results || [];
-        if (this.consumed > res.length) this.consumed = 0;      // the browser restarted its list
+        if (this.consumed > res.length) { this.consumed = 0; this.held = null; }     // the browser restarted its list
         let i = this.consumed, final = "", interim = "";
         for (; i < res.length && res[i].isFinal; i++) final += " " + res[i][0].transcript;
         const upTo = i;
         for (let j = i; j < res.length; j++) interim += " " + (res[j][0] ? res[j][0].transcript : "");
         final = final.replace(/\s+/g, " ").trim(); interim = interim.replace(/\s+/g, " ").trim();
+        const rawInterim = interim, from = this.consumed;
+        // v7: a held interim was already handed on (below), but WebKit may go on to extend or finalise that same
+        // result ("buddy" -> "buddy what's happening"): pass on only the new words, and nothing twice.
+        if (this.held && this.held.from === from) {
+          const h = this.held.text.toLowerCase();
+          const strip = (t) => { const tl = t.toLowerCase(); return tl === h ? "" : tl.startsWith(h + " ") ? t.slice(h.length).trim() : null; };
+          if (final) { const f = strip(final); if (f !== null) final = f; this.held = null; if (!final) this.consumed = upTo; }
+          else if (interim) { const x = strip(interim); if (x !== null) interim = x; }
+        }
         this.onSpeech();
         this.onEvent(final ? "result (final)" : "result");
         if (final) this._deliver(final, upTo);
@@ -104,7 +113,12 @@
           this.onResult(interim, false);
           // WebKit in continuous mode can leave a result interim for ever: if it stops changing, it's final.
           if (r.continuous) this.stableTimer = setTimeout(() => {
-            if (r === this.rec && this.lastInterim === interim) { this.onEvent("interim held still: used as final"); this._deliver(interim, this.pendingLen); }
+            if (r === this.rec && this.lastInterim === interim) {
+              this.onEvent("interim held still: used as final");
+              // Keep reading from the same result: the browser may still extend it (see above).
+              this.held = { from, text: rawInterim };
+              this._deliver(interim, from);
+            }
           }, this.stableMs);
         }
       };
@@ -178,12 +192,38 @@
       } catch (e) { this._error("unlock failed: " + (e && (e.message || e.name))); }
     }
     _error(msg) { this.lastError = msg; this.lastErrorAt = Date.now(); this.onError(msg); }
-    /** The saved voice if this device has it (by id, then by name), else null = the browser default. */
+    /** The saved voice if this device has it (by id, then by name), else null. */
     pickVoice(id) {
       if (!id) return null;
       let list = [];
       try { list = this.synth.getVoices() || []; } catch (e) { list = []; }
       return list.find((v) => v.voiceURI === id) || list.find((v) => v.name === id) || null;
+    }
+    /** How good a voice is likely to sound, for "Automatic": higher is better (v7). Novelty voices score very low. */
+    static scoreVoice(v, lang) {
+      const name = String(v.name || ""), vl = String(v.lang || "").replace("_", "-").toLowerCase(), want = String(lang || "").toLowerCase();
+      if (!/^en/.test(vl) && vl.split("-")[0] !== want.split("-")[0]) return -1000;
+      let s = 0;
+      if (want && vl === want) s += 40;
+      else if (vl === "en-au") s += 30; else if (vl === "en-gb") s += 25; else if (vl === "en-us") s += 20;
+      else if (want && vl.split("-")[0] === want.split("-")[0]) s += 10;
+      if (/premium/i.test(name)) s += 50;
+      else if (/neural|natural|enhanced/i.test(name)) s += 45;
+      if (/siri/i.test(name)) s += 40;
+      if (/^google (uk|us) english/i.test(name)) s += 30;
+      if (/\b(samantha|daniel|karen|ava|zoe|serena|lee|matilda|allison|susan|tom|moira|tessa|kate|oliver|arthur|catherine|gordon|evan|nathan|noelle|joelle)\b/i.test(name)) s += 15;
+      if (/\b(albert|bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|superstar|trinoids|whisper|wobble|zarvox|fred|junior|kathy|ralph|grandma|grandpa|eddy|flo|reed|rocko|sandy|shelley|deranged|hysterical|pipe organ)\b/i.test(name)) s -= 100;
+      if (/compact/i.test(name)) s -= 10;
+      if (v.localService) s += 3;
+      return s;
+    }
+    /** The best-sounding voice this device has for the language (or null if it has none). */
+    bestVoice(lang) {
+      let list = [];
+      try { list = this.synth.getVoices() || []; } catch (e) { list = []; }
+      let best = null, bestScore = -999;
+      for (const v of list) { const sc = BrowserTTS.scoreVoice(v, lang); if (sc > bestScore) { best = v; bestScore = sc; } }
+      return best;
     }
     _chunks(text) {
       // Chrome cuts long utterances off after about 15 s, so speak sentence-sized pieces.
@@ -204,8 +244,10 @@
       const busy = !!(this.synth.speaking || this.synth.pending);
       this.cancel();
       const my = ++this.token;
-      const voice = this.pickVoice(opts.voice);
-      this.voiceUsed = voice ? voice.name : (opts.voice ? "default (saved voice not on this device)" : "default");
+      const saved = this.pickVoice(opts.voice);
+      const voice = saved || this.bestVoice(opts.lang);
+      this.voiceUsed = saved ? saved.name : voice ? voice.name + (opts.voice ? " (auto: saved voice not on this device)" : " (auto)")
+        : (opts.voice ? "default (saved voice not on this device)" : "default");
       const chunks = this._chunks(text);
       this.speaking = true; this.started = Date.now();
       this.onStart();
