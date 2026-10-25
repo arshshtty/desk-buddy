@@ -32,6 +32,7 @@
       this.lang = (opts && opts.lang) || "en-AU";
       this.running = false; this.rec = null; this.fatal = false;
       this.starts = 0; this.lastStart = 0; this.gotResult = false; this.maxTimer = 0; this.source = "";
+      this.consumed = 0; this.uttInterims = []; this.stableTimer = 0; this.stableMs = 1500; this.lastInterim = "";
       this.onResult = noop; this.onSpeech = noop; this.onState = noop; this.onEnd = noop; this.onEvent = noop;
     }
     get kind() { return "browser"; }
@@ -44,6 +45,7 @@
       if (this.fatal || this.running) return false;
       const r = this._make(!!opts.continuous);
       this.rec = r; this.gotResult = false; this.source = opts.source || ""; this.lastInterim = ""; this.aborting = false;
+      this.consumed = 0; this.uttInterims = []; this.pendingLen = 0; clearTimeout(this.stableTimer);
       this.lastStart = Date.now(); this.starts++;
       this.running = true;                       // set now so nothing else starts a second session
       let ok = false;
@@ -59,6 +61,13 @@
     stop() { if (this.rec && this.running) { try { this.rec.stop(); } catch (e) { /* already stopped */ } } }
     /** Stop now and throw away anything heard (used when Buddy starts talking). */
     abort() { if (this.rec && this.running) { this.aborting = true; try { this.rec.abort(); } catch (e) { /* already stopped */ } } }
+    _deliver(text, upTo) {
+      const meta = { interims: this.uttInterims.slice() };
+      this.consumed = Math.max(this.consumed, upTo || 0);
+      this.uttInterims = []; this.lastInterim = ""; this.gotResult = true;
+      clearTimeout(this.stableTimer);
+      this.onResult(text, true, meta);
+    }
     _make(continuous) {
       const r = new this.Impl();
       r.continuous = !!continuous;               // normally false: end by itself after one utterance
@@ -70,17 +79,34 @@
       r.onsoundstart = () => { if (r === this.rec) this.onEvent("soundstart"); };
       r.onspeechstart = () => { if (r === this.rec) this.onEvent("speechstart"); this.onSpeech(); };
       r.onnomatch = () => { if (r === this.rec) this.onEvent("nomatch"); };
+      // Results are read from `consumed` (the first result not yet handed on) to the end, not from
+      // ev.resultIndex: Safari/Chrome on iOS (WebKit) moves resultIndex past earlier words of the same
+      // utterance, so "Buddy, what's going on" arrived as just "what's going on". Every interim seen in an
+      // utterance is passed along with its final (meta.interims), so a wake word that showed up in an
+      // interim but was dropped from the final still counts.
       r.onresult = (ev) => {
         if (r !== this.rec) return;
-        let interim = "", final = "";
-        for (let i = ev.resultIndex; i < ev.results.length; i++) {
-          const res = ev.results[i];
-          if (res.isFinal) final += res[0].transcript; else interim += res[0].transcript;
-        }
+        const res = ev.results || [];
+        if (this.consumed > res.length) this.consumed = 0;      // the browser restarted its list
+        let i = this.consumed, final = "", interim = "";
+        for (; i < res.length && res[i].isFinal; i++) final += " " + res[i][0].transcript;
+        const upTo = i;
+        for (let j = i; j < res.length; j++) interim += " " + (res[j][0] ? res[j][0].transcript : "");
+        final = final.replace(/\s+/g, " ").trim(); interim = interim.replace(/\s+/g, " ").trim();
         this.onSpeech();
-        this.onEvent(final.trim() ? "result (final)" : "result");
-        if (final.trim()) { this.gotResult = true; this.onResult(final.trim(), true); }
-        else if (interim.trim()) { this.lastInterim = interim.trim(); this.onResult(interim.trim(), false); }
+        this.onEvent(final ? "result (final)" : "result");
+        if (final) this._deliver(final, upTo);
+        clearTimeout(this.stableTimer);
+        if (interim) {
+          this.lastInterim = interim; this.pendingLen = res.length;
+          if (this.uttInterims[this.uttInterims.length - 1] !== interim) this.uttInterims.push(interim);
+          if (this.uttInterims.length > 30) this.uttInterims.shift();
+          this.onResult(interim, false);
+          // WebKit in continuous mode can leave a result interim for ever: if it stops changing, it's final.
+          if (r.continuous) this.stableTimer = setTimeout(() => {
+            if (r === this.rec && this.lastInterim === interim) { this.onEvent("interim held still: used as final"); this._deliver(interim, this.pendingLen); }
+          }, this.stableMs);
+        }
       };
       r.onerror = (ev) => {
         const e = ev.error;
@@ -99,11 +125,12 @@
         this.running = false; this.rec = null;
         // Android Chrome sometimes ends a session with only interim results and no final one. Use the
         // last interim as the final transcript, unless we threw the session away ourselves.
-        if (!this.gotResult && this.lastInterim && !this.aborting) {
-          this.gotResult = true;
+        clearTimeout(this.stableTimer);
+        if (this.lastInterim && !this.aborting) {
           this.onEvent("end without final: used the last interim");
-          this.onResult(this.lastInterim, true);
+          this._deliver(this.lastInterim, 0);
         }
+        this.uttInterims = []; this.lastInterim = "";
         this.onEvent("end");
         this.onState("idle");
         this.onEnd(this.gotResult);              // no restart: the next voice onset starts a new session

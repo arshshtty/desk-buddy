@@ -25,6 +25,7 @@
     face: "sphere",          // "sphere" (default) or "eye" (Classic eye)
     name: "Buddy",           // shown in the captions as "Buddy: ..."
     wakeWord: "Jarvis",
+    wakeAck: "chime",        // after the wake word on its own: "chime" | "yes" (says "Yes?") | "none"
     wakeMode: "on",          // require the wake word: "on" | "conversation" (not while someone is on camera) | "off"
     listenMode: "always",    // "always" (voice-activated), "tap" (tap to talk only), "off"
     lang: navigator.language || "en-AU",
@@ -75,6 +76,7 @@
       }
       if (s.face !== "eye") s.face = "sphere";
       if (!["on", "conversation", "off"].includes(s.wakeMode)) s.wakeMode = "on";
+      if (!["chime", "yes", "none"].includes(s.wakeAck)) s.wakeAck = "chime";
       if (!["auto", "browser", "whisper"].includes(s.sttEngine)) s.sttEngine = "auto";
       if (!["auto", "shared", "release", "continuous"].includes(s.srMode)) s.srMode = "auto";
       if (!["off", "show", "speak"].includes(s.glances)) s.glances = "off";

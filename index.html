@@ -31,6 +31,7 @@
     <div class="dl" id="dText"></div>
     <div class="dl muted" id="dCam"></div>
     <div class="dl muted" id="dReply"></div>
+    <div class="dl muted" id="dWake"></div>
   </div>
 
   <div id="captions">
@@ -100,8 +101,16 @@
 
       <fieldset>
         <legend>Listening</legend>
-        <label>Wake word
-          <input id="sWake" autocomplete="off" spellcheck="false">
+        <label>Wake words (separate with commas)
+          <input id="sWake" autocomplete="off" spellcheck="false" placeholder="Buddy, Hey Buddy, Jarvis">
+        </label>
+        <p class="muted small" id="wakeNote">Say a wake word anywhere: "Buddy, what's the time?", "What's the time, Buddy?", or just "Buddy" on its own, then ask after the chime (within 8 seconds). Similar-sounding words count too ("body", "buddie", "birdie" for Buddy), most of all at the start or end. A name of two or more syllables that isn't an everyday word works best.</p>
+        <label>When you say just the wake word
+          <select id="sWakeAck">
+            <option value="chime">Play a short chime (default)</option>
+            <option value="yes">Say "Yes?"</option>
+            <option value="none">Nothing (the face still shows it's listening)</option>
+          </select>
         </label>
         <label>Require the wake word
           <select id="sWakeMode">
@@ -118,7 +127,7 @@
             <option value="off">Off: microphone never used</option>
           </select>
         </label>
-        <p class="muted small" id="beepNote">On Android, Chrome plays a short sound each time Web Speech recognition starts, and a web page can't turn that off. "Always" keeps it to one sound each time you start speaking. "Tap to talk only" makes no sound until you press 🎙️. The On-device Whisper engine (Speech engines, below) makes no sound at all. Tip: with Web Speech, put "Hey" before the wake word ("Hey Jarvis, …") so the phone has started listening by the time you say the name.</p>
+        <p class="muted small" id="beepNote">On Android, Chrome plays a short sound each time Web Speech recognition starts, and a web page can't turn that off. "Always" keeps it to one sound each time you start speaking. "Tap to talk only" makes no sound until you press 🎙️. The On-device Whisper engine (Speech engines, below) makes no sound at all. Tip: with Web Speech, the phone can miss the first word, so say the wake word by itself first ("Buddy" … chime … "what's the time?"), or put it at the end ("what's the time, Buddy?").</p>
         <label>Mic sensitivity <output id="oSens"></output> (higher hears quieter speech)
           <input id="sSens" type="range" min="1" max="10" step="1">
         </label>

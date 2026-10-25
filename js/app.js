@@ -51,6 +51,7 @@
   const isWhisper = () => stt.kind === "whisper";
 
   const COOLDOWN_MS = 2000;     // recognition starts at most once every 2 s (each start beeps on Android)
+  const AWAIT_MS = 8000;        // after the wake word on its own, the next thing you say is for Buddy
   const TAIL_MS = 800;          // keep ignoring the mic this long after Buddy stops talking
   const BARGE_TAIL_MS = 300;    // shorter when the speech was cut off by a tap
   const ECHO_WINDOW_MS = 120000;
@@ -120,7 +121,7 @@
     if (listeningForCommand()) return setStatus(settings.listenMode === "always" ? "Listening… just talk" : "Press 🎙️ to talk", "wake");
     if (settings.listenMode === "off") return setStatus("Microphone off (settings)", "off");
     if (settings.listenMode === "tap") return setStatus("Press 🎙️ to talk", "off");
-    if (vad.running || (st.strategy === "continuous" && !isWhisper())) return setStatus('Say "' + settings.wakeWord + '…" or press 🎙️', "on");
+    if (vad.running || (st.strategy === "continuous" && !isWhisper())) return setStatus('Say "' + primaryWake() + '…" or press 🎙️', "on");
     return setStatus("Mic starting…", "off");
   }
   function progressText() {
@@ -186,23 +187,108 @@
   const nearMid = (heard, want) => near(heard, want) || (want.length >= 4 && lev(heard.replace(/'s$/, ""), want) <= 2) ||
     (skeleton(want).length >= 3 && skeleton(heard) === skeleton(want));
   const GREET_RE = /^(hey|hi|hello|ok|okay|oi|yo|hiya|ey|a|uh|um|oh|so|right|excuse)$/;
-  /** Returns the words after the wake word, "" if it was said alone, or null if it wasn't said. */
-  function afterWake(text) {
-    const wt = tokens(settings.wakeWord), tt = tokens(text);
-    if (!wt.length) return null;
-    for (let i = 0; i + 1 <= tt.length; i++) {
-      // loose matching for the first word of the wake word in the first three words, or after "hey"/"ok"/"hi"
-      // At the very start (or after "hey"/"ok"/"um"): anything that sounds like it. Second or third word: only a
-      // near spelling or the same sound, so "the service was slow" isn't taken for "Jarvis".
-      const loose = i === 0 || GREET_RE.test(tt[i - 1] || "");
-      const first = loose ? nearLoose : i <= 2 ? nearMid : near;
-      if (i + wt.length <= tt.length && wt.every((w, j) => (j === 0 ? first : near)(tt[i + j], w))) return tt.slice(i + wt.length).join(" ");
-      // a one-word wake word split in two ("jar vis", "her vis")
-      if (loose && wt.length === 1 && i + 1 < tt.length && tt[i].length <= 4 && (tt[i] + tt[i + 1]).length >= 4 && nearLoose(tt[i] + tt[i + 1], wt[0]))
-        return tt.slice(i + 2).join(" ");
-    }
-    return null;
+  // How a word sounds, more loosely than skeleton(): voiced and unvoiced pairs merge (d/t, b/p, g/k, v/f,
+  // s/z), and an "r" between a vowel and a consonant is dropped (non-rhotic "birdie" ~ "buddy"). Short wake words like
+  // "Buddy" have a tiny skeleton ("bd"), so they need this: "body", "buddie", "bodie", "birdie", "butty",
+  // "bud", "but he" all come out as "pt".
+  function soundKey(w) {
+    let x = String(w).toLowerCase().replace(/'s$/, "").replace(/[^a-z]/g, "");
+    if (!x) return "";
+    x = x.replace(/^(dj|ch|sh|zh|j|g(?=[eiy]))/, "j").replace(/ph/g, "f").replace(/ck/g, "k").replace(/qu/g, "k")
+         .replace(/c(?=[eiy])/g, "s").replace(/[cqk]/g, "k").replace(/x/g, "ks").replace(/w/g, "v");
+    x = x.replace(/([aeiouy])r(?=[^aeiouy])/g, "$1");
+    const first = x[0];
+    x = x.slice(1).replace(/[aeiouyh]/g, "");
+    x = (/[aeiouy]/.test(first) ? "" : first) + x;
+    x = x.replace(/d/g, "t").replace(/b/g, "p").replace(/g/g, "k").replace(/v/g, "f").replace(/z/g, "s");
+    return x.replace(/(.)\1+/g, "$1");
   }
+  // Everyday words that sound like short wake words. They only count when they're the whole utterance.
+  const COMMON = new Set(("but bit bet bat bad bed bid bud's put pot pat pet pit pity petty pretty potty bought boot " +
+    "about by buy be bye bee been did dad do done dead died date data daddy baby bobby's pop pope pub tab tub " +
+    "the a an it is was").split(" "));
+  /** How well one heard word matches one wake-word word: 3 exact, 2 close spelling (or same sound for a
+      longer word), 1.5 same sound for a short word ("body" ~ "buddy"), 1 loose (clipped or misheard), 0 no. */
+  function wordScore(heard, want) {
+    if (!heard || !want) return 0;
+    const h = heard.replace(/'s$/, "");
+    if (heard === want || h === want || (!want.endsWith("s") && h.replace(/s$/, "") === want)) return 3;
+    if (COMMON.has(heard) || COMMON.has(h)) return 0;
+    const hk = soundKey(heard), wk = soundKey(want), d = lev(h, want);
+    if (near(h, want) || (want.length >= 6 && d <= 2)) return 2;
+    if (hk && hk === wk) return wk.length >= 3 ? 2 : 1.5;
+    if (want.length >= 4 && d <= 2 && h[0] === want[0]) return 1.5;
+    if (nearLoose(heard, want)) return 1;
+    // short wake words: same first letter, one sound different ("bobby" ~ "buddy"), similar length
+    if (wk.length >= 2 && hk.length >= 1 && h[0] === want[0] && lev(hk, wk) <= 1 && Math.abs(h.length - want.length) <= 1) return 1;
+    return 0;
+  }
+  /** The wake words, from Settings ("Buddy, Hey Buddy, Jarvis"): lists of words, longest first. */
+  function wakeList() {
+    const out = [], seen = new Set();
+    for (const part of String(settings.wakeWord || "").split(/[,;\/|]+/)) {
+      let t = tokens(part);
+      if (t.length > 1 && GREET_RE.test(t[0])) t = t.slice(1);   // "Hey Buddy": the "hey" is optional anyway
+      const k = t.join(" ");
+      if (t.length && !seen.has(k)) { seen.add(k); out.push(t); }
+    }
+    return out.sort((x, y) => y.length - x.length);
+  }
+  const primaryWake = () => {
+    const first = String(settings.wakeWord || "").split(/[,;\/|]+/).map((x) => x.trim()).filter(Boolean)[0];
+    return first || DB.store.DEFAULTS.wakeWord;
+  };
+  /** Find a wake word in `text`. Returns { rest, path, heard, wake } or null.
+      rest: the words around the wake word ("" if it was said alone). path says which rule matched:
+      "alone", "start", "after-greeting", "start-fuzzy", "near-start" (2nd/3rd word), "end", "middle", "split". */
+  function matchWake(text) {
+    const tt = tokens(text), list = wakeList();
+    if (!tt.length || !list.length) return null;
+    // Very short utterances ("buddy", "hey body", "but he") are almost certainly the wake word on its own.
+    let best = null;
+    const consider = (i, len, score, wt, how) => {
+      const before = tt.slice(0, i), after = tt.slice(i + len);
+      const greetOnly = before.every((w) => GREET_RE.test(w));
+      const alone = greetOnly && after.length === 0;
+      const atStart = i === 0;
+      const afterGreet = !atStart && greetOnly;
+      const atEnd = after.length === 0 || (after.length === 1 && /^(please|mate|now|thanks)$/.test(after[0]));
+      let ok, path;
+      if (alone) { ok = score >= 1; path = "alone"; }
+      else if (atStart || afterGreet) { ok = score >= 1; path = score >= 3 ? (atStart ? "start" : "after-greeting") : "start-fuzzy"; }
+      else if (atEnd && score >= 1.5) { ok = true; path = "end"; }
+      else if (i <= 2 && score >= 2) { ok = true; path = "near-start"; }
+      else { ok = score >= 3 || (score >= 2 && soundKey(wt[0]).length >= 3); path = "middle"; }
+      if (how === "split" && ok) path = alone ? "alone" : "split";
+      if (!ok) return;
+      const rank = score * 10 + (alone ? 5 : atStart || afterGreet ? 4 : atEnd ? 3 : 0) + len;
+      if (!best || rank > best.rank) best = { rank, rest: before.filter((w) => !(greetOnly && GREET_RE.test(w))).concat(after).join(" "),
+        path, heard: tt.slice(i, i + len).join(" "), wake: wt.join(" ") };
+    };
+    for (const wt of list) {
+      for (let i = 0; i < tt.length; i++) {
+        if (i + wt.length <= tt.length) {
+          let sc = 3;
+          for (let j = 0; j < wt.length; j++) sc = Math.min(sc, j === 0 ? wordScore(tt[i + j], wt[j]) : (wordScore(tt[i + j], wt[j]) >= 2 ? 3 : 0));
+          if (sc > 0) consider(i, wt.length, sc, wt, "");
+        }
+        // a one-word wake word split in two ("jar vis", "but he")
+        if (wt.length === 1 && i + 1 < tt.length && tt[i].length <= 4 && (tt[i] + tt[i + 1]).length >= 4) {
+          const joined = tt[i] + tt[i + 1];
+          // the same sound only counts when the second half is just a vowel sound ("but he", "bud e"), so
+          // "but it" / "but I" don't
+          const sc = nearLoose(joined, wt[0]) || (/^(h[aeiouy]+|e+|ie|y)$/.test(tt[i + 1]) && soundKey(joined) === soundKey(wt[0])) ? 1 : 0;
+          // only at the edges: "but he said" in the middle of a sentence isn't "Buddy"
+          if (sc && (i === 0 || tt.slice(0, i).every((w) => GREET_RE.test(w)) || i + 2 === tt.length)) consider(i, 2, sc, wt, "split");
+        }
+      }
+    }
+    if (!best) return null;
+    delete best.rank;
+    return best;
+  }
+  /** Returns the words around the wake word, "" if it was said alone, or null if it wasn't said. */
+  function afterWake(text) { const m = matchWake(text); return m ? m.rest : null; }
   /** Does this utterance need the wake word right now? */
   function wakeNeeded() {
     if (settings.wakeMode === "off") return false;
@@ -215,7 +301,7 @@
     "your we he she they them this that there here be am are was were do does did have has had what what's how who " +
     "not no yes oh um uh like just").split(" "));
   function contentTokens(s) {
-    const wake = new Set(tokens(settings.wakeWord));
+    const wake = new Set(wakeList().flat());
     return tokens(s).filter((w) => !STOPWORDS.has(w) && !wake.has(w));
   }
   function rememberSaid(text) {
@@ -366,6 +452,7 @@
     stt.onEnd = (got) => {
       // No restart here (except the continuous fallback). The next voice onset (or tap) starts the next session.
       const sess = st.sess; st.sess = null;
+      if (st.interimWake) { st.interimWake = null; eye.setListening(listeningForCommand()); }
       if (!isWhisper() && sess && !sess.result && !sess.aborted && !sess.error && sess.source === "voice") {
         // A voice started this session but nothing was recognised. Once is normal (a cough, the TV);
         // repeatedly means recognition can't hear the mic this way.
@@ -376,18 +463,28 @@
         const dur = Date.now() - st.lastSttStart;
         st.contBackoff = dur < 1500 ? Math.min(5000, (st.contBackoff || 250) * 2) : 0;
         clearTimeout(st.contTimer);
-        st.contTimer = setTimeout(runContinuous, st.contBackoff || 250);
+        // Restart straight away (keeps it warm, so less of your first word is lost), backing off only if it keeps ending at once.
+        st.contTimer = setTimeout(runContinuous, st.contBackoff || 60);
       } else if (!isWhisper() && st.strategy !== "shared") ensureMic();
       if (isWhisper() && settings.listenMode !== "always" && !stt.running && Date.now() >= st.pttUntil) vad.stop();
       const h = $("heard");
       if (h.classList.contains("partial")) showHeard("");
       idleStatus();
     };
-    stt.onResult = (text, isFinal) => {
+    stt.onResult = (text, isFinal, meta) => {
       if (isFinal) st.lastTranscript = text;
       if (muted()) { if (isFinal) st.drops.muted++; return; }
-      if (!isFinal) { if (!isEcho(text)) showHeard(text, "partial"); return; }
-      handleFinal(text);
+      if (!isFinal) {
+        if (isEcho(text)) return;
+        showHeard(text, "partial");
+        // Interim wake word: react as soon as it's heard (the final may drop it, especially on iPhone).
+        if (!st.interimWake && wakeNeeded() && !listeningForCommand()) {
+          const m = matchWake(text);
+          if (m) { st.interimWake = m; eye.setListening(true); setStatus("Listening…", "wake"); }
+        }
+        return;
+      }
+      handleFinal(text, meta);
       if (isWhisper() && settings.listenMode !== "always" && Date.now() >= st.pttUntil) vad.stop();
     };
     vad.onVoiceStart = () => {
@@ -410,39 +507,67 @@
   }
 
   /** Handle one final transcript. Returns what happened, for the tests:
-      "muted" | "echo" | "ignored" | "wake" | "stop" | "command" | "empty". */
-  function handleFinal(text) {
+      "muted" | "echo" | "ignored" | "wake" | "stop" | "command" | "empty".
+      meta.interims: the interim transcripts of this utterance (Web Speech), checked for the wake word too. */
+  function handleFinal(text, meta) {
     text = String(text || "").trim();
+    const interimWake = st.interimWake; st.interimWake = null;
     if (!text) return "empty";
     if (muted()) { st.drops.muted++; return "muted"; }
     if (isEcho(text)) { st.drops.echo++; showHeard(""); return "echo"; }
-    const wakeRest = afterWake(text);
-    if (STOP_RE.test((wakeRest == null ? text : wakeRest).trim()) && (wakeRest !== null || listeningForCommand())) {
+    let wake = matchWake(text);
+    if (!wake) {
+      // The final transcript lost the wake word, but an interim had it: count it, and use the whole final.
+      let im = interimWake;
+      for (const t of (meta && meta.interims) || []) { if (im) break; im = matchWake(t); }
+      // ...unless the interim was only the start of a longer word: "bud" -> "budget is tight"
+      if (im && tokens(text).some((w) => w !== im.heard && w.length > im.heard.length && w.startsWith(im.heard))) im = null;
+      if (im) {
+        const r = matchWake(text);
+        wake = { rest: r ? r.rest : text, path: "interim (" + im.path + ")", heard: im.heard, wake: im.wake };
+        // the final may be just the rest of the interim: if the interim's leftover words are the whole final, it was said alone
+        if (tokens(text).join(" ") === tokens(im.heard).join(" ")) wake.rest = "";
+      }
+    }
+    const wakeRest = wake ? wake.rest : null;
+    const now = Date.now();
+    const followOpen = listeningForCommand();
+    if (STOP_RE.test((wakeRest == null ? text : wakeRest).trim()) && (wakeRest !== null || followOpen)) {
       showHeard(text);
+      noteWake(wake ? wake.path : "follow-up", wake, text);
       st.awaitUntil = st.followUntil = st.pttUntil = 0;
       eye.setListening(false); idleStatus();
       return "stop";
     }
-    const now = Date.now();
     let cmd = null;
     if (wakeRest !== null) {
       activity("speech");
       showHeard(text);
+      noteWake(wake.path, wake, text);
       if (wakeRest) cmd = wakeRest;
       else {
-        st.awaitUntil = now + 8000;
+        // Said on its own: acknowledge (chime / "Yes?") and listen for the question without the wake word.
+        st.awaitUntil = now + AWAIT_MS;
         eye.setMood("curious", 8); eye.setListening(true); idleStatus();
-        setTimeout(() => { if (Date.now() >= st.awaitUntil) { eye.setListening(listeningForCommand()); idleStatus(); } }, 8100);
+        ackWake();
+        setTimeout(() => { if (Date.now() >= st.awaitUntil) { eye.setListening(listeningForCommand()); idleStatus(); } }, AWAIT_MS + 100);
         return "wake";
       }
-    } else if (listeningForCommand() || !wakeNeeded()) { activity("speech"); showHeard(text); cmd = text; }
+    } else if (followOpen || !wakeNeeded()) {
+      activity("speech"); showHeard(text); cmd = text;
+      noteWake(!wakeNeeded() ? "not needed" : now < st.awaitUntil ? "after the wake word alone" : now < st.pttUntil ? "mic button" : "follow-up", null, text);
+    }
     if (cmd == null) {                      // not for Buddy (no wake word): show it faintly, and say why
       st.drops.ignored++;
+      if (interimWake) { eye.setListening(listeningForCommand()); idleStatus(); }   // an interim looked like the wake word, but wasn't
       showHeard(text, true);
+      noteWake("none", null, text);
       logEvent("ignored: no wake word");
       if (now - st.lastHint > 12000 && !tts.speaking && !brain.busy) {
         st.lastHint = now;
-        showSaid('I heard you, but not "' + settings.wakeWord + '". Say "' + settings.wakeWord + '" first, or turn off "Require the wake word" in Settings.', true);
+        const w = primaryWake();
+        showSaid('I heard "' + text.slice(0, 60) + '", but not "' + w + '". Try saying "' + w + '" by itself, wait for the chime, then ask. ' +
+          'Or say it at the end ("…, ' + w + '"), add other wake words in Settings, or turn off "Require the wake word".', true);
       }
       return "ignored";
     }
@@ -453,7 +578,35 @@
     runCommand(cmd);
     return "command";
   }
-
+  /** Remember which wake rule fired, for the diagnostics strip. */
+  function noteWake(path, wake, text) {
+    st.lastWake = { path, heard: wake ? wake.heard : "", wake: wake ? wake.wake : "", text, at: Date.now() };
+  }
+  /** "I'm listening": a short two-note chime (default), a spoken "Yes?", or nothing. */
+  function ackWake() {
+    showSaid("Yes?");
+    if (settings.wakeAck === "none") return;
+    if (settings.wakeAck === "yes") { say("Yes?", true).then(() => { st.awaitUntil = Math.max(st.awaitUntil, Date.now() + AWAIT_MS); eye.setListening(true); idleStatus(); }); return; }
+    chime();
+  }
+  function chime() {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      const ctx = st.chimeCtx || (st.chimeCtx = new AC());
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      const t0 = ctx.currentTime + 0.02;
+      [[880, 0], [1320, 0.11]].forEach(([f, dt]) => {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = "sine"; o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, t0 + dt);
+        g.gain.exponentialRampToValueAtTime(0.18, t0 + dt + 0.015);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dt + 0.16);
+        o.connect(g); g.connect(ctx.destination); o.start(t0 + dt); o.stop(t0 + dt + 0.18);
+      });
+      st.chimes = (st.chimes || 0) + 1;
+    } catch (e) { logEvent("chime failed: " + ((e && e.message) || e)); }
+  }
   /* ---------------- commands ---------------- */
   const NOTE_RE = /^(?:please\s+)?(?:can you\s+)?(?:take|make|add|write|jot)(?:\s+down)?(?:\s+me)?\s+a\s+note(?:\s+(?:that|saying|to say|of))?[\s:,-]*(.*)$/i;
   const NOTE2_RE = /^note(?:\s+that)?[\s:,-]+(.+)$/i;
@@ -812,7 +965,7 @@
     const s = settings;
     $("sKey").value = "";
     $("sModel").value = s.model; $("sEffort").value = s.effort; $("sSystem").value = s.system; $("sMemory").value = s.memory;
-    $("sWake").value = s.wakeWord; $("sWakeMode").value = s.wakeMode; $("sListenMode").value = s.listenMode; $("sLang").value = s.lang;
+    $("sWake").value = s.wakeWord; $("sWakeMode").value = s.wakeMode; $("sWakeAck").value = s.wakeAck; $("sListenMode").value = s.listenMode; $("sLang").value = s.lang;
     $("sName").value = s.name; $("sFollow").value = s.followUp;
     fillVoices();
     $("sRate").value = s.rate; $("sPitch").value = s.pitch; $("oRate").textContent = (+s.rate).toFixed(2); $("oPitch").textContent = (+s.pitch).toFixed(2);
@@ -854,6 +1007,7 @@
       system: $("sSystem").value.trim() || DB.store.DEFAULT_SYSTEM,
       memory: Math.max(0, Math.min(20, Math.round(num("sMemory", 6)))),
       wakeWord: $("sWake").value.trim() || DB.store.DEFAULTS.wakeWord,
+      wakeAck: ["chime", "yes", "none"].includes($("sWakeAck").value) ? $("sWakeAck").value : "chime",
       wakeMode: ["on", "conversation", "off"].includes($("sWakeMode").value) ? $("sWakeMode").value : "on",
       listenMode: ["always", "tap", "off"].includes($("sListenMode").value) ? $("sListenMode").value : "always",
       name: $("sName").value.trim() || DB.store.DEFAULTS.name,
@@ -914,7 +1068,7 @@
     const list = DB.store.notes(), ul = $("notesList");
     ul.textContent = "";
     $("notesEmpty").hidden = list.length > 0;
-    $("notesEmpty").textContent = 'No notes yet. Say "' + settings.wakeWord + ', take a note: buy milk".';
+    $("notesEmpty").textContent = 'No notes yet. Say "' + primaryWake() + ', take a note: buy milk".';
     for (const n of list.slice().reverse()) {
       const li = document.createElement("li");
       const t = document.createElement("div"); t.className = "t"; t.textContent = n.text;
@@ -991,6 +1145,10 @@
       " · claude " + (!DB.store.getKey() ? "no key" : b ? (b.ok ? "ok " + (b.ms / 1000).toFixed(1) + " s" : b.text.slice(0, 90)) : "not asked yet") +
       " · voice out " + (tts.supported ? (tts.voiceUsed || "default") + ", " + nv + " voices" + (st.lastReply ? ", last " + st.lastReply : "") +
         (tts.lastError && Date.now() - tts.lastErrorAt < 120000 ? ", error: " + tts.lastError : "") : "unsupported");
+    const lw = st.lastWake;
+    $("dWake").textContent = "wake words: " + wakeList().map((w) => w.join(" ")).join(", ") + " · last match: " +
+      (!lw ? "none yet" : (lw.path === "none" ? "none (no wake word in \u201c" + lw.text.slice(0, 40) + "\u201d)" :
+        lw.path + (lw.heard ? " (heard \u201c" + lw.heard + "\u201d for " + lw.wake + ")" : "")) + " " + Math.round((Date.now() - lw.at) / 1000) + " s ago");
     $("dCam").textContent = cam.on ? "camera: on · " + cam.faceDetection + " · light " + cam.light + (cam.present ? " · someone here" : "") : "camera: " + (st.camError ? st.camError : "off");
   }
   setInterval(updateDiag, 150);
@@ -1033,7 +1191,7 @@
     updateCamButtons();
     eye.setMood("happy", 2.5);
     const hi = !DB.store.getKey() ? "Hi! Add a Claude API key in settings so I can think."
-      : settings.listenMode === "always" ? 'Hi! Say "' + settings.wakeWord + '" when you need me.'
+      : settings.listenMode === "always" ? 'Hi! Say "' + primaryWake() + '" when you need me.'
       : "Hi! Press the microphone when you need me.";
     await say(hi, true);
     if (st.camError) showSaid(cameraNote(), true);
@@ -1053,6 +1211,6 @@
 
   // For debugging and the automated tests. Nothing here exposes the API key.
   window.deskBuddy = { get eye() { return eye; }, setFace, cam, brain, vad, get stt() { return stt; }, get tts() { return tts; }, get settings() { return settings; },
-                       state: st, handleFinal, runCommand, afterWake, skeleton, wakeNeeded, setPhase, isEcho, echoScore, muted, startRecognition, showHeard, showSaid, start,
+                       state: st, handleFinal, runCommand, afterWake, matchWake, wakeList, soundKey, skeleton, wakeNeeded, chime, setPhase, isEcho, echoScore, muted, startRecognition, showHeard, showSaid, start,
                        say, micState, engineText, calibrate, maybeGlance, runContinuous, srFailure, get strategy() { return st.strategy; } };
 })();
